@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "Backend API for the Deadly Dozen notify form and Gym Partner Information form",
   "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node server.js"
   },
