@@ -72,22 +72,53 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 // never slows down or blocks the person submitting the form — if it fails
 // (bad address, rate limit, etc.) the submission itself is unaffected, the
 // gym just won't appear in nearby-search results until it succeeds.
+async function tryGeocode(q) {
+  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(q)}`;
+  const resp = await fetch(url, {
+    headers: { "User-Agent": "EnduroverseGymLocator/1.0" },
+  });
+  if (!resp.ok) return null;
+  const results = await resp.json();
+  if (!results || !results[0]) return null;
+  const lat = parseFloat(results[0].lat);
+  const lng = parseFloat(results[0].lon);
+  return Number.isFinite(lat) && Number.isFinite(lng) ? { lat, lng } : null;
+}
+
+// Nominatim (free OpenStreetMap geocoding) often can't resolve a precise
+// street address — house number, cross street, layout name, etc. If the
+// full address doesn't match, progressively drop the most specific leading
+// part and retry (e.g. "28, 4th cross, KEB Layout, Bengaluru, Karnataka
+// 560094" -> "4th cross, KEB Layout, Bengaluru, Karnataka 560094" -> ... ->
+// "Bengaluru, Karnataka 560094"), and fall back to a bare pincode if one is
+// present. This trades precision for actually getting a usable pin.
+async function geocodeAddress(b) {
+  const full = [b.address, b.city, b.state, b.pincode, b.country].filter(Boolean).join(", ");
+  if (!full) return null;
+
+  let loc = await tryGeocode(full);
+  if (loc) return loc;
+
+  const parts = full.split(",").map(p => p.trim()).filter(Boolean);
+  for (let i = 1; i < parts.length; i++) {
+    loc = await tryGeocode(parts.slice(i).join(", "));
+    if (loc) return loc;
+  }
+
+  const pinMatch = full.match(/\b\d{6}\b/);
+  if (pinMatch) {
+    loc = await tryGeocode(pinMatch[0]);
+    if (loc) return loc;
+  }
+
+  return null;
+}
+
 async function geocodeAndStore(id, b) {
   try {
-    const q = [b.address, b.city, b.state, b.pincode, b.country].filter(Boolean).join(", ");
-    if (!q) return;
-    const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(q)}`;
-    const resp = await fetch(url, {
-      headers: { "User-Agent": "EnduroverseGymLocator/1.0" },
-    });
-    if (!resp.ok) return;
-    const results = await resp.json();
-    if (results && results[0]) {
-      const lat = parseFloat(results[0].lat);
-      const lng = parseFloat(results[0].lon);
-      if (Number.isFinite(lat) && Number.isFinite(lng)) {
-        await pool.query(`UPDATE gym_submissions SET lat=$1, lng=$2 WHERE id=$3`, [lat, lng, id]);
-      }
+    const loc = await geocodeAddress(b);
+    if (loc) {
+      await pool.query(`UPDATE gym_submissions SET lat=$1, lng=$2 WHERE id=$3`, [loc.lat, loc.lng, id]);
     }
   } catch (err) {
     console.error("geocode error for gym", id, err.message);
@@ -195,7 +226,7 @@ app.get("/api/gym", async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT id, gym_name, address, pincode, city, state, country, phone, type,
-              specialised, association, track_host, equipment, submitted_at
+              specialised, association, track_host, equipment, submitted_at, lat, lng
        FROM gym_submissions ORDER BY submitted_at DESC`
     );
     res.json(rows);
@@ -218,6 +249,34 @@ app.delete("/api/gym/:id", async (req, res) => {
   } catch (err) {
     console.error("gym delete error:", err);
     res.status(500).json({ success: false, error: "Server error deleting submission" });
+  }
+});
+
+// Admin-only: retry geocoding for one submission (e.g. its address failed to
+// resolve to a pin the first time). Reads the current row so it re-geocodes
+// whatever address is stored now, then reports back whether a location was
+// found so the admin UI can show a result immediately.
+app.post("/api/gym/:id/regeocode", async (req, res) => {
+  if (req.query.password !== ADMIN_PASSWORD) {
+    return res.status(401).json({ success: false, error: "Unauthorized" });
+  }
+  try {
+    const { rows } = await pool.query(
+      `SELECT address, city, state, pincode, country FROM gym_submissions WHERE id=$1`,
+      [req.params.id]
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, error: "Submission not found" });
+    }
+    const loc = await geocodeAddress(rows[0]);
+    if (!loc) {
+      return res.json({ success: false, error: "Couldn't find that address — try adding a pincode or checking spelling." });
+    }
+    await pool.query(`UPDATE gym_submissions SET lat=$1, lng=$2 WHERE id=$3`, [loc.lat, loc.lng, req.params.id]);
+    res.json({ success: true, lat: loc.lat, lng: loc.lng });
+  } catch (err) {
+    console.error("regeocode error:", err);
+    res.status(500).json({ success: false, error: "Server error re-geocoding submission" });
   }
 });
 
