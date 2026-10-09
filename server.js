@@ -85,6 +85,15 @@ async function initSchema() {
     );
   `);
 
+  // Razorpay payment tracking for Mini Challenge (safe to re-run).
+  await pool.query(`
+    ALTER TABLE mini_challenge_signups
+      ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending',
+      ADD COLUMN IF NOT EXISTS razorpay_order_id TEXT,
+      ADD COLUMN IF NOT EXISTS razorpay_payment_id TEXT,
+      ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ;
+  `);
+
   // Admin-uploaded files for the Race Prep page: the rule book and the
   // 30/60/90-day training programs. Stored directly in Postgres (as bytes)
   // rather than on disk, since Render's free web service disk is wiped on
@@ -394,6 +403,66 @@ app.post("/api/mini-challenge", async (req, res) => {
   } catch (err) {
     console.error("mini-challenge insert error:", err);
     res.status(500).json({ success: false, error: "Server error saving registration" });
+  }
+});
+
+// ---- Razorpay payment for Mini Challenge ----
+// Needs env vars RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET (set in Render).
+const crypto = require("crypto");
+const RZP_KEY_ID = process.env.RAZORPAY_KEY_ID;
+const RZP_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET;
+
+app.post("/api/mini-challenge/order", async (req, res) => {
+  if (!RZP_KEY_ID || !RZP_KEY_SECRET) {
+    return res.status(503).json({ success: false, error: "payments_not_configured" });
+  }
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, name, email, phone, amount, payment_status FROM mini_challenge_signups WHERE id = $1`,
+      [req.body && req.body.id]
+    );
+    if (!rows.length) return res.status(404).json({ success: false, error: "Registration not found" });
+    const r = rows[0];
+    if (r.payment_status === "paid") return res.status(409).json({ success: false, error: "Already paid" });
+    const auth = Buffer.from(RZP_KEY_ID + ":" + RZP_KEY_SECRET).toString("base64");
+    const rz = await fetch("https://api.razorpay.com/v1/orders", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Basic " + auth },
+      body: JSON.stringify({ amount: r.amount * 100, currency: "INR", receipt: "mini_" + r.id })
+    });
+    const order = await rz.json();
+    if (!rz.ok) {
+      console.error("razorpay order error:", order);
+      return res.status(502).json({ success: false, error: "Could not start payment" });
+    }
+    await pool.query(`UPDATE mini_challenge_signups SET razorpay_order_id = $1 WHERE id = $2`, [order.id, r.id]);
+    res.json({ success: true, key_id: RZP_KEY_ID, order_id: order.id, amount: order.amount,
+               name: r.name, email: r.email, phone: r.phone });
+  } catch (err) {
+    console.error("mini-challenge order error:", err);
+    res.status(500).json({ success: false, error: "Server error starting payment" });
+  }
+});
+
+app.post("/api/mini-challenge/verify", async (req, res) => {
+  if (!RZP_KEY_SECRET) return res.status(503).json({ success: false, error: "payments_not_configured" });
+  try {
+    const b = req.body || {};
+    const expected = crypto.createHmac("sha256", RZP_KEY_SECRET)
+      .update(b.razorpay_order_id + "|" + b.razorpay_payment_id).digest("hex");
+    if (!b.razorpay_signature || expected !== b.razorpay_signature) {
+      return res.status(400).json({ success: false, error: "Payment verification failed" });
+    }
+    const up = await pool.query(
+      `UPDATE mini_challenge_signups SET payment_status = 'paid', razorpay_payment_id = $1, paid_at = now()
+       WHERE id = $2 AND razorpay_order_id = $3 RETURNING id`,
+      [b.razorpay_payment_id, b.id, b.razorpay_order_id]
+    );
+    if (!up.rowCount) return res.status(404).json({ success: false, error: "Registration not found" });
+    res.json({ success: true });
+  } catch (err) {
+    console.error("mini-challenge verify error:", err);
+    res.status(500).json({ success: false, error: "Server error verifying payment" });
   }
 });
 
