@@ -8,7 +8,9 @@ const express = require("express");
 const { Pool } = require("pg");
 
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+// Raised from 2mb to comfortably fit uploaded rule book / program PDFs,
+// which are sent as base64 JSON (base64 runs ~33% larger than the file).
+app.use(express.json({ limit: "20mb" }));
 
 // Basic CORS so the form (hosted elsewhere, e.g. Wix) can call this API.
 app.use((req, res, next) => {
@@ -60,6 +62,50 @@ async function initSchema() {
       phone TEXT NOT NULL,
       division TEXT NOT NULL,
       submitted_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+
+  // Mini Challenge (31 Oct 2026) registrations.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS mini_challenge_signups (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      phone TEXT NOT NULL,
+      email TEXT NOT NULL,
+      participation TEXT NOT NULL,
+      partner_name TEXT,
+      partner_phone TEXT,
+      partner_email TEXT,
+      amount INTEGER NOT NULL,
+      medical_issue TEXT NOT NULL,
+      medical_details TEXT,
+      waiver_accepted BOOLEAN NOT NULL DEFAULT false,
+      waiver_signed_name TEXT,
+      submitted_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+
+  // Admin-uploaded files for the Race Prep page: the rule book and the
+  // 30/60/90-day training programs. Stored directly in Postgres (as bytes)
+  // rather than on disk, since Render's free web service disk is wiped on
+  // every deploy — a file saved to disk would vanish on the next code push.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS race_resources (
+      key TEXT PRIMARY KEY,
+      file_name TEXT,
+      mime_type TEXT,
+      file_data BYTEA,
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+
+  // Small generic key/value store for simple admin-editable text settings,
+  // e.g. the YouTube training video link.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS site_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT,
+      updated_at TIMESTAMPTZ DEFAULT now()
     );
   `);
 }
@@ -311,6 +357,208 @@ app.get("/api/notify", async (req, res) => {
   } catch (err) {
     console.error("notify list error:", err);
     res.status(500).json({ success: false, error: "Server error fetching signups" });
+  }
+});
+
+// ---- Mini Challenge registrations (31 Oct 2026) ----
+const MINI_PRICES = { solo: 1499, pair: 2499 };
+
+app.post("/api/mini-challenge", async (req, res) => {
+  try {
+    const b = req.body || {};
+    const type = b.participation === "pair" ? "pair" : b.participation === "solo" ? "solo" : null;
+    if (!b.name || !b.phone || !b.email || !type) {
+      return res.status(400).json({ success: false, error: "Missing required fields" });
+    }
+    if (type === "pair" && (!b.partner_name || !b.partner_phone)) {
+      return res.status(400).json({ success: false, error: "Partner details required for pairs" });
+    }
+    if (b.medical_issue !== "yes" && b.medical_issue !== "no") {
+      return res.status(400).json({ success: false, error: "Medical declaration required" });
+    }
+    if (b.waiver_accepted !== true || !b.waiver_signed_name) {
+      return res.status(400).json({ success: false, error: "Waiver must be accepted and signed" });
+    }
+    const { rows } = await pool.query(
+      `INSERT INTO mini_challenge_signups
+        (name, phone, email, participation, partner_name, partner_phone, partner_email,
+         amount, medical_issue, medical_details, waiver_accepted, waiver_signed_name)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,true,$11) RETURNING id`,
+      [b.name, b.phone, b.email, type,
+       type === "pair" ? b.partner_name : null,
+       type === "pair" ? b.partner_phone : null,
+       type === "pair" ? (b.partner_email || null) : null,
+       MINI_PRICES[type], b.medical_issue, b.medical_details || null, b.waiver_signed_name]
+    );
+    res.json({ success: true, id: rows[0].id, amount: MINI_PRICES[type] });
+  } catch (err) {
+    console.error("mini-challenge insert error:", err);
+    res.status(500).json({ success: false, error: "Server error saving registration" });
+  }
+});
+
+app.get("/api/mini-challenge", async (req, res) => {
+  if (req.query.password !== ADMIN_PASSWORD) {
+    return res.status(401).json({ success: false, error: "Unauthorized" });
+  }
+  try {
+    const { rows } = await pool.query(`SELECT * FROM mini_challenge_signups ORDER BY submitted_at DESC`);
+    res.json(rows);
+  } catch (err) {
+    console.error("mini-challenge list error:", err);
+    res.status(500).json({ success: false, error: "Server error fetching registrations" });
+  }
+});
+
+app.delete("/api/mini-challenge/:id", async (req, res) => {
+  if (req.query.password !== ADMIN_PASSWORD) {
+    return res.status(401).json({ success: false, error: "Unauthorized" });
+  }
+  try {
+    await pool.query(`DELETE FROM mini_challenge_signups WHERE id = $1`, [req.params.id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("mini-challenge delete error:", err);
+    res.status(500).json({ success: false, error: "Server error deleting registration" });
+  }
+});
+
+// ---- Race Prep resources: Rule Book + 30/60/90-day programs ----
+// Valid resource keys. Keeping an explicit list avoids the admin page
+// accidentally creating arbitrary rows.
+const RESOURCE_KEYS = ["rulebook", "program_30", "program_60", "program_90"];
+
+// Public: lets a page check whether a file has been uploaded yet (and its
+// name/date) without needing the admin password and without sending the
+// file's bytes.
+app.get("/api/resources/:key/meta", async (req, res) => {
+  if (!RESOURCE_KEYS.includes(req.params.key)) {
+    return res.status(404).json({ success: false, error: "Unknown resource" });
+  }
+  try {
+    const { rows } = await pool.query(
+      `SELECT file_name, mime_type, updated_at, (file_data IS NOT NULL) AS exists
+       FROM race_resources WHERE key=$1`,
+      [req.params.key]
+    );
+    if (rows.length === 0 || !rows[0].exists) {
+      return res.json({ exists: false });
+    }
+    res.json({ exists: true, fileName: rows[0].file_name, updatedAt: rows[0].updated_at });
+  } catch (err) {
+    console.error("resource meta error:", err);
+    res.status(500).json({ success: false, error: "Server error checking resource" });
+  }
+});
+
+// Public: streams the actual file for download.
+app.get("/api/resources/:key/file", async (req, res) => {
+  if (!RESOURCE_KEYS.includes(req.params.key)) {
+    return res.status(404).send("Not found");
+  }
+  try {
+    const { rows } = await pool.query(
+      `SELECT file_name, mime_type, file_data FROM race_resources WHERE key=$1`,
+      [req.params.key]
+    );
+    if (rows.length === 0 || !rows[0].file_data) {
+      return res.status(404).send("Not uploaded yet");
+    }
+    res.setHeader("Content-Type", rows[0].mime_type || "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="${rows[0].file_name || req.params.key}"`);
+    res.send(rows[0].file_data);
+  } catch (err) {
+    console.error("resource file error:", err);
+    res.status(500).send("Server error fetching file");
+  }
+});
+
+// Admin-only: upload or replace a resource. Body: { password, fileName,
+// mimeType, dataBase64 }. The file is sent as base64 since it's going
+// through the same JSON endpoint style as the rest of this API.
+app.post("/api/resources/:key", async (req, res) => {
+  if (!RESOURCE_KEYS.includes(req.params.key)) {
+    return res.status(404).json({ success: false, error: "Unknown resource" });
+  }
+  const password = req.query.password || (req.body && req.body.password);
+  if (password !== ADMIN_PASSWORD) {
+    return res.status(401).json({ success: false, error: "Unauthorized" });
+  }
+  try {
+    const { fileName, mimeType, dataBase64 } = req.body || {};
+    if (!dataBase64) {
+      return res.status(400).json({ success: false, error: "Missing file data" });
+    }
+    const buffer = Buffer.from(dataBase64, "base64");
+    await pool.query(
+      `INSERT INTO race_resources (key, file_name, mime_type, file_data, updated_at)
+       VALUES ($1, $2, $3, $4, now())
+       ON CONFLICT (key) DO UPDATE SET
+         file_name = EXCLUDED.file_name,
+         mime_type = EXCLUDED.mime_type,
+         file_data = EXCLUDED.file_data,
+         updated_at = now()`,
+      [req.params.key, fileName || req.params.key, mimeType || "application/pdf", buffer]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error("resource upload error:", err);
+    res.status(500).json({ success: false, error: "Server error uploading file" });
+  }
+});
+
+// Admin-only: remove an uploaded resource (reverts the page to "coming soon").
+app.delete("/api/resources/:key", async (req, res) => {
+  if (!RESOURCE_KEYS.includes(req.params.key)) {
+    return res.status(404).json({ success: false, error: "Unknown resource" });
+  }
+  if (req.query.password !== ADMIN_PASSWORD) {
+    return res.status(401).json({ success: false, error: "Unauthorized" });
+  }
+  try {
+    await pool.query(`DELETE FROM race_resources WHERE key=$1`, [req.params.key]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("resource delete error:", err);
+    res.status(500).json({ success: false, error: "Server error removing file" });
+  }
+});
+
+// ---- Site settings (small text values, e.g. the training video link) ----
+const SETTINGS_KEYS = ["youtube_video_id"];
+
+app.get("/api/settings/:key", async (req, res) => {
+  if (!SETTINGS_KEYS.includes(req.params.key)) {
+    return res.status(404).json({ success: false, error: "Unknown setting" });
+  }
+  try {
+    const { rows } = await pool.query(`SELECT value FROM site_settings WHERE key=$1`, [req.params.key]);
+    res.json({ value: rows.length ? rows[0].value : "" });
+  } catch (err) {
+    console.error("settings read error:", err);
+    res.status(500).json({ success: false, error: "Server error reading setting" });
+  }
+});
+
+app.post("/api/settings/:key", async (req, res) => {
+  if (!SETTINGS_KEYS.includes(req.params.key)) {
+    return res.status(404).json({ success: false, error: "Unknown setting" });
+  }
+  const password = req.query.password || (req.body && req.body.password);
+  if (password !== ADMIN_PASSWORD) {
+    return res.status(401).json({ success: false, error: "Unauthorized" });
+  }
+  try {
+    const { value } = req.body || {};
+    await pool.query(
+      `INSERT INTO site_settings (key, value, updated_at) VALUES ($1, $2, now())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [req.params.key, value || ""]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error("settings write error:", err);
+    res.status(500).json({ success: false, error: "Server error saving setting" });
   }
 });
 
