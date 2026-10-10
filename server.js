@@ -94,6 +94,14 @@ async function initSchema() {
       ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ;
   `);
 
+  // Relay team fields for Mini Challenge (safe to re-run).
+  await pool.query(`
+    ALTER TABLE mini_challenge_signups
+      ADD COLUMN IF NOT EXISTS relay_category TEXT,
+      ADD COLUMN IF NOT EXISTS team_name TEXT,
+      ADD COLUMN IF NOT EXISTS team_members TEXT;
+  `);
+
   // Admin-uploaded files for the Race Prep page: the rule book and the
   // 30/60/90-day training programs. Stored directly in Postgres (as bytes)
   // rather than on disk, since Render's free web service disk is wiped on
@@ -370,17 +378,26 @@ app.get("/api/notify", async (req, res) => {
 });
 
 // ---- Mini Challenge registrations (31 Oct 2026) ----
-const MINI_PRICES = { solo: 1499, pair: 2499 };
+const MINI_PRICES = { solo: 1499, pair: 2499, relay: 3499 };
+const RELAY_CATS = ["4 men", "2 men + 2 women", "4 women"];
 
 app.post("/api/mini-challenge", async (req, res) => {
   try {
     const b = req.body || {};
-    const type = b.participation === "pair" ? "pair" : b.participation === "solo" ? "solo" : null;
+    const type = ["solo", "pair", "relay"].includes(b.participation) ? b.participation : null;
     if (!b.name || !b.phone || !b.email || !type) {
       return res.status(400).json({ success: false, error: "Missing required fields" });
     }
     if (type === "pair" && (!b.partner_name || !b.partner_phone)) {
       return res.status(400).json({ success: false, error: "Partner details required for pairs" });
+    }
+    if (type === "relay") {
+      if (!RELAY_CATS.includes(b.relay_category)) {
+        return res.status(400).json({ success: false, error: "Choose a relay team category" });
+      }
+      if (!b.team_name || !b.team_members) {
+        return res.status(400).json({ success: false, error: "Team name and members required for relay" });
+      }
     }
     if (b.medical_issue !== "yes" && b.medical_issue !== "no") {
       return res.status(400).json({ success: false, error: "Medical declaration required" });
@@ -391,13 +408,17 @@ app.post("/api/mini-challenge", async (req, res) => {
     const { rows } = await pool.query(
       `INSERT INTO mini_challenge_signups
         (name, phone, email, participation, partner_name, partner_phone, partner_email,
-         amount, medical_issue, medical_details, waiver_accepted, waiver_signed_name)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,true,$11) RETURNING id`,
+         amount, medical_issue, medical_details, waiver_accepted, waiver_signed_name,
+         relay_category, team_name, team_members)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,true,$11,$12,$13,$14) RETURNING id`,
       [b.name, b.phone, b.email, type,
        type === "pair" ? b.partner_name : null,
        type === "pair" ? b.partner_phone : null,
        type === "pair" ? (b.partner_email || null) : null,
-       MINI_PRICES[type], b.medical_issue, b.medical_details || null, b.waiver_signed_name]
+       MINI_PRICES[type], b.medical_issue, b.medical_details || null, b.waiver_signed_name,
+       type === "relay" ? b.relay_category : null,
+       type === "relay" ? String(b.team_name).slice(0, 120) : null,
+       type === "relay" ? String(b.team_members).slice(0, 1500) : null]
     );
     res.json({ success: true, id: rows[0].id, amount: MINI_PRICES[type] });
   } catch (err) {
