@@ -490,8 +490,9 @@ app.post("/api/mini-challenge/order", async (req, res) => {
 // ---- Confirmation email (Resend). Env: RESEND_API_KEY, MAIL_FROM, MAIL_NOTIFY (optional organiser copy) ----
 const esc = v => String(v == null ? "" : v).replace(/[&<>"]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
 async function sendMiniConfirmation(id) {
+  const useSmtp = !!(process.env.SMTP_HOST || process.env.EMAIL_USER);
   const key = process.env.RESEND_API_KEY;
-  if (!key) { console.log("confirmation email skipped: RESEND_API_KEY not set"); return; }
+  if (!useSmtp && !key) { console.log("confirmation email skipped: no SMTP_HOST or RESEND_API_KEY set"); return; }
   const { rows } = await pool.query(`SELECT * FROM mini_challenge_signups WHERE id = $1`, [id]);
   if (!rows.length) return;
   const r = rows[0];
@@ -512,9 +513,24 @@ async function sendMiniConfirmation(id) {
     <p>Your wave time will be shared closer to the event. Please keep this email for your records.</p>
     <p>For any query, contact us at <a href="mailto:india@deadlydozen.in">india@deadlydozen.in</a>.</p>
     <p style="color:#666;font-size:13px">– Team Deadly Dozen · deadlydozen.in</p></div>`;
-  const to = [r.email];
-  const body = { reply_to: "india@deadlydozen.in", from: process.env.MAIL_FROM || "Deadly Dozen <onboarding@resend.dev>", to,
-                 subject: "Registration confirmed – Deadly Dozen Mini Challenge (31 Oct 2026)", html };
+  const subject = "Registration confirmed – Deadly Dozen Mini Challenge (31 Oct 2026)";
+  if (useSmtp) {
+    const nodemailer = require("nodemailer");
+    const host = process.env.SMTP_HOST || "smtp.gmail.com";
+    const port = parseInt(process.env.SMTP_PORT || "587", 10);
+    const user = process.env.SMTP_USER || process.env.EMAIL_USER;
+    const pass = process.env.SMTP_PASS || process.env.EMAIL_PASS;
+    const tx = nodemailer.createTransport({ host, port, secure: port === 465, auth: user ? { user, pass } : undefined });
+    await tx.sendMail({
+      from: process.env.MAIL_FROM || process.env.EMAIL_FROM || user,
+      to: r.email, bcc: process.env.MAIL_NOTIFY || undefined,
+      replyTo: "india@deadlydozen.in", subject, html
+    });
+    console.log("confirmation email sent (smtp) to", r.email);
+    return;
+  }
+  const body = { reply_to: "india@deadlydozen.in", from: process.env.MAIL_FROM || "Deadly Dozen <onboarding@resend.dev>",
+                 to: [r.email], subject, html };
   if (process.env.MAIL_NOTIFY) body.bcc = [process.env.MAIL_NOTIFY];
   const resp = await fetch("https://api.resend.com/emails", {
     method: "POST", headers: { Authorization: "Bearer " + key, "Content-Type": "application/json" },
