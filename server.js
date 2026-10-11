@@ -113,6 +113,25 @@ async function initSchema() {
       ADD COLUMN IF NOT EXISTS emergency_phone TEXT;
   `);
 
+  // Coupon codes for the Mini Challenge (codes must start with DDM).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS mini_challenge_coupons (
+      code TEXT PRIMARY KEY,
+      percent INTEGER NOT NULL,
+      active BOOLEAN NOT NULL DEFAULT true,
+      max_uses INTEGER,
+      used_count INTEGER NOT NULL DEFAULT 0,
+      expires_at TIMESTAMPTZ,
+      note TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`
+    ALTER TABLE mini_challenge_signups
+      ADD COLUMN IF NOT EXISTS coupon_code TEXT,
+      ADD COLUMN IF NOT EXISTS discount_percent INTEGER;
+  `);
+
   // Admin-uploaded files for the Race Prep page: the rule book and the
   // 30/60/90-day training programs. Stored directly in Postgres (as bytes)
   // rather than on disk, since Render's free web service disk is wiped on
@@ -396,6 +415,45 @@ const MINI_TEST_CODE = (process.env.MINI_TEST_CODE || "").toLowerCase();
 const miniAmount = (type, email) =>
   MINI_TEST_CODE && String(email || "").toLowerCase().includes("+" + MINI_TEST_CODE + "@") ? 1 : MINI_PRICES[type];
 
+// ---- Coupons: code must start with DDM, then is cross-checked in mini_challenge_coupons ----
+const COUPON_RE = /^DDM[A-Z0-9]{1,17}$/;
+const cleanCode = c => String(c || "").trim().toUpperCase();
+// Returns { ok:true, coupon } or { ok:false, error }.
+async function lookupCoupon(raw) {
+  const code = cleanCode(raw);
+  if (!COUPON_RE.test(code)) return { ok: false, error: "Invalid coupon code" };
+  const { rows } = await pool.query(`SELECT * FROM mini_challenge_coupons WHERE code = $1`, [code]);
+  const c = rows[0];
+  if (!c || !c.active) return { ok: false, error: "Invalid coupon code" };
+  if (c.expires_at && new Date(c.expires_at) < new Date()) return { ok: false, error: "This coupon has expired" };
+  if (c.max_uses != null && c.used_count >= c.max_uses) return { ok: false, error: "This coupon has been fully used" };
+  return { ok: true, coupon: c };
+}
+const discounted = (base, percent) => Math.max(0, Math.round(base * (100 - percent) / 100));
+// Light brute-force guard: 12 coupon checks per minute per IP.
+const couponHits = new Map();
+function couponLimited(ip) {
+  const now = Date.now(), arr = (couponHits.get(ip) || []).filter(t => now - t < 60000);
+  arr.push(now); couponHits.set(ip, arr);
+  return arr.length > 12;
+}
+
+app.post("/api/mini-challenge/coupon", async (req, res) => {
+  try {
+    if (couponLimited(req.ip)) return res.status(429).json({ success: false, error: "Too many attempts. Please wait a minute." });
+    const b = req.body || {};
+    const type = ["solo", "pair", "relay"].includes(b.participation) ? b.participation : null;
+    const r = await lookupCoupon(b.code);
+    if (!r.ok) return res.status(400).json({ success: false, error: r.error });
+    const base = type ? MINI_PRICES[type] : null;
+    res.json({ success: true, code: r.coupon.code, percent: r.coupon.percent,
+               base, final: base == null ? null : discounted(base, r.coupon.percent) });
+  } catch (err) {
+    console.error("coupon check error:", err);
+    res.status(500).json({ success: false, error: "Could not check the coupon right now" });
+  }
+});
+
 app.post("/api/mini-challenge", async (req, res) => {
   try {
     const b = req.body || {};
@@ -426,23 +484,34 @@ app.post("/api/mini-challenge", async (req, res) => {
     if (b.waiver_accepted !== true || !b.waiver_signed_name) {
       return res.status(400).json({ success: false, error: "Waiver must be accepted and signed" });
     }
+    let amount = miniAmount(type, b.email), couponCode = null, couponPct = null;
+    if (b.coupon_code && String(b.coupon_code).trim()) {
+      const cr = await lookupCoupon(b.coupon_code);
+      if (!cr.ok) return res.status(400).json({ success: false, error: cr.error });
+      if (amount > 1) {   // the secret Rs 1 test amount ignores coupons
+        couponCode = cr.coupon.code; couponPct = cr.coupon.percent;
+        amount = discounted(MINI_PRICES[type], couponPct);
+      }
+    }
     const { rows } = await pool.query(
       `INSERT INTO mini_challenge_signups
         (name, phone, email, participation, partner_name, partner_phone, partner_email,
          amount, medical_issue, medical_details, waiver_accepted, waiver_signed_name,
-         relay_category, team_name, team_members, gender, address, emergency_name, emergency_phone)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,true,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING id`,
+         relay_category, team_name, team_members, gender, address, emergency_name, emergency_phone,
+         coupon_code, discount_percent)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,true,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING id`,
       [b.name, b.phone, b.email, type,
        type === "pair" ? b.partner_name : null,
        type === "pair" ? b.partner_phone : null,
        type === "pair" ? (b.partner_email || null) : null,
-       miniAmount(type, b.email), b.medical_issue, b.medical_details || null, b.waiver_signed_name,
+       amount, b.medical_issue, b.medical_details || null, b.waiver_signed_name,
        type === "relay" ? b.relay_category : null,
        type === "relay" ? String(b.team_name).slice(0, 120) : null,
        type === "relay" ? String(b.team_members).slice(0, 1500) : null,
-       b.gender, String(b.address).slice(0, 500), String(b.emergency_name).slice(0, 120), String(b.emergency_phone).slice(0, 20)]
+       b.gender, String(b.address).slice(0, 500), String(b.emergency_name).slice(0, 120), String(b.emergency_phone).slice(0, 20),
+       couponCode, couponPct]
     );
-    res.json({ success: true, id: rows[0].id, amount: miniAmount(type, b.email) });
+    res.json({ success: true, id: rows[0].id, amount, coupon_code: couponCode, discount_percent: couponPct });
   } catch (err) {
     console.error("mini-challenge insert error:", err);
     res.status(500).json({ success: false, error: "Server error saving registration" });
@@ -456,17 +525,26 @@ const RZP_KEY_ID = process.env.RAZORPAY_KEY_ID;
 const RZP_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET;
 
 app.post("/api/mini-challenge/order", async (req, res) => {
-  if (!RZP_KEY_ID || !RZP_KEY_SECRET) {
-    return res.status(503).json({ success: false, error: "payments_not_configured" });
-  }
   try {
     const { rows } = await pool.query(
-      `SELECT id, name, email, phone, amount, payment_status FROM mini_challenge_signups WHERE id = $1`,
+      `SELECT id, name, email, phone, amount, payment_status, coupon_code FROM mini_challenge_signups WHERE id = $1`,
       [req.body && req.body.id]
     );
     if (!rows.length) return res.status(404).json({ success: false, error: "Registration not found" });
     const r = rows[0];
     if (r.payment_status === "paid") return res.status(409).json({ success: false, error: "Already paid" });
+    if (r.amount === 0) {   // 100% coupon: nothing to charge, confirm the spot directly
+      await pool.query(
+        `UPDATE mini_challenge_signups SET payment_status = 'paid', razorpay_payment_id = 'FREE-COUPON', paid_at = now() WHERE id = $1`,
+        [r.id]
+      );
+      if (r.coupon_code) await pool.query(`UPDATE mini_challenge_coupons SET used_count = used_count + 1 WHERE code = $1`, [r.coupon_code]);
+      sendMiniConfirmation(r.id).catch(e => console.error("confirmation email error:", e));
+      return res.json({ success: true, free: true });
+    }
+    if (!RZP_KEY_ID || !RZP_KEY_SECRET) {
+      return res.status(503).json({ success: false, error: "payments_not_configured" });
+    }
     const auth = Buffer.from(RZP_KEY_ID + ":" + RZP_KEY_SECRET).toString("base64");
     const rz = await fetch("https://api.razorpay.com/v1/orders", {
       method: "POST",
@@ -504,7 +582,7 @@ async function sendMiniConfirmation(id) {
     <table style="border-collapse:collapse;background:#f6f6f6;width:100%">
       ${line("Registration #", r.id)}${line("Category", kind)}${line("Team name", r.team_name)}
       ${line("Partner", r.partner_name)}${line("Team members", r.team_members)}
-      ${line("Amount paid", "₹" + r.amount)}${line("Payment ID", r.razorpay_payment_id)}
+      ${line("Coupon", r.coupon_code ? r.coupon_code + " (" + r.discount_percent + "% off)" : "")}${line("Amount paid", "₹" + r.amount)}${line("Payment ID", r.razorpay_payment_id)}
     </table>
     <h3 style="margin:20px 0 6px">Venue</h3>
     <p style="margin:0 0 8px"><b>South United Football Club (SUFC)</b><br>
@@ -550,10 +628,14 @@ app.post("/api/mini-challenge/verify", async (req, res) => {
     }
     const up = await pool.query(
       `UPDATE mini_challenge_signups SET payment_status = 'paid', razorpay_payment_id = $1, paid_at = now()
-       WHERE id = $2 AND razorpay_order_id = $3 RETURNING id`,
+       WHERE id = $2 AND razorpay_order_id = $3
+       RETURNING id, coupon_code, (SELECT payment_status FROM mini_challenge_signups WHERE id = $2) AS prev_status`,
       [b.razorpay_payment_id, b.id, b.razorpay_order_id]
     );
     if (!up.rowCount) return res.status(404).json({ success: false, error: "Registration not found" });
+    if (up.rows[0].coupon_code && up.rows[0].prev_status !== "paid") {
+      await pool.query(`UPDATE mini_challenge_coupons SET used_count = used_count + 1 WHERE code = $1`, [up.rows[0].coupon_code]);
+    }
     sendMiniConfirmation(b.id).catch(e => console.error("confirmation email error:", e));
     res.json({ success: true });
   } catch (err) {
@@ -572,6 +654,47 @@ app.get("/api/mini-challenge", async (req, res) => {
   } catch (err) {
     console.error("mini-challenge list error:", err);
     res.status(500).json({ success: false, error: "Server error fetching registrations" });
+  }
+});
+
+// Organiser: list / create-or-update / switch off coupons. Protected by the organiser password.
+app.get("/api/mini-challenge-coupons", async (req, res) => {
+  if (req.query.password !== MINI_ADMIN_PASSWORD) return res.status(401).json({ success: false, error: "Unauthorized" });
+  try {
+    const { rows } = await pool.query(`SELECT * FROM mini_challenge_coupons ORDER BY created_at DESC`);
+    res.json(rows);
+  } catch (err) {
+    console.error("coupon list error:", err);
+    res.status(500).json({ success: false, error: "Server error" });
+  }
+});
+
+app.post("/api/mini-challenge-coupons", async (req, res) => {
+  if (req.query.password !== MINI_ADMIN_PASSWORD) return res.status(401).json({ success: false, error: "Unauthorized" });
+  try {
+    const b = req.body || {};
+    const code = cleanCode(b.code);
+    if (!COUPON_RE.test(code)) return res.status(400).json({ success: false, error: "Code must start with DDM (letters/numbers only, max 20 characters)" });
+    if (b.delete === true) {
+      await pool.query(`DELETE FROM mini_challenge_coupons WHERE code = $1`, [code]);
+      return res.json({ success: true });
+    }
+    const percent = parseInt(b.percent, 10);
+    if (!(percent >= 1 && percent <= 100)) return res.status(400).json({ success: false, error: "Percent must be 1 to 100" });
+    const maxUses = b.max_uses === "" || b.max_uses == null ? null : parseInt(b.max_uses, 10);
+    if (maxUses != null && !(maxUses >= 1)) return res.status(400).json({ success: false, error: "Max uses must be 1 or more" });
+    const exp = b.expires_at ? new Date(b.expires_at) : null;
+    if (exp && isNaN(exp)) return res.status(400).json({ success: false, error: "Bad expiry date" });
+    await pool.query(
+      `INSERT INTO mini_challenge_coupons (code, percent, active, max_uses, expires_at, note)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (code) DO UPDATE SET percent = $2, active = $3, max_uses = $4, expires_at = $5, note = $6`,
+      [code, percent, b.active === false ? false : true, maxUses, exp, b.note ? String(b.note).slice(0, 200) : null]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error("coupon save error:", err);
+    res.status(500).json({ success: false, error: "Server error" });
   }
 });
 
