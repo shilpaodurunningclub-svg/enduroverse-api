@@ -102,6 +102,15 @@ async function initSchema() {
       ADD COLUMN IF NOT EXISTS team_members TEXT;
   `);
 
+  // Gender, address and emergency contact for Mini Challenge (safe to re-run).
+  await pool.query(`
+    ALTER TABLE mini_challenge_signups
+      ADD COLUMN IF NOT EXISTS gender TEXT,
+      ADD COLUMN IF NOT EXISTS address TEXT,
+      ADD COLUMN IF NOT EXISTS emergency_name TEXT,
+      ADD COLUMN IF NOT EXISTS emergency_phone TEXT;
+  `);
+
   // Admin-uploaded files for the Race Prep page: the rule book and the
   // 30/60/90-day training programs. Stored directly in Postgres (as bytes)
   // rather than on disk, since Render's free web service disk is wiped on
@@ -391,6 +400,12 @@ app.post("/api/mini-challenge", async (req, res) => {
     if (type === "pair" && (!b.partner_name || !b.partner_phone)) {
       return res.status(400).json({ success: false, error: "Partner details required for pairs" });
     }
+    if (b.gender !== "Male" && b.gender !== "Female") {
+      return res.status(400).json({ success: false, error: "Please select Male or Female" });
+    }
+    if (!b.address || !b.emergency_name || !b.emergency_phone) {
+      return res.status(400).json({ success: false, error: "Address and emergency contact are required" });
+    }
     if (type === "relay") {
       if (!RELAY_CATS.includes(b.relay_category)) {
         return res.status(400).json({ success: false, error: "Choose a relay team category" });
@@ -409,8 +424,8 @@ app.post("/api/mini-challenge", async (req, res) => {
       `INSERT INTO mini_challenge_signups
         (name, phone, email, participation, partner_name, partner_phone, partner_email,
          amount, medical_issue, medical_details, waiver_accepted, waiver_signed_name,
-         relay_category, team_name, team_members)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,true,$11,$12,$13,$14) RETURNING id`,
+         relay_category, team_name, team_members, gender, address, emergency_name, emergency_phone)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,true,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING id`,
       [b.name, b.phone, b.email, type,
        type === "pair" ? b.partner_name : null,
        type === "pair" ? b.partner_phone : null,
@@ -418,7 +433,8 @@ app.post("/api/mini-challenge", async (req, res) => {
        MINI_PRICES[type], b.medical_issue, b.medical_details || null, b.waiver_signed_name,
        type === "relay" ? b.relay_category : null,
        type === "relay" ? String(b.team_name).slice(0, 120) : null,
-       type === "relay" ? String(b.team_members).slice(0, 1500) : null]
+       type === "relay" ? String(b.team_members).slice(0, 1500) : null,
+       b.gender, String(b.address).slice(0, 500), String(b.emergency_name).slice(0, 120), String(b.emergency_phone).slice(0, 20)]
     );
     res.json({ success: true, id: rows[0].id, amount: MINI_PRICES[type] });
   } catch (err) {
