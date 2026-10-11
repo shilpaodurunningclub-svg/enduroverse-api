@@ -27,6 +27,8 @@ const pool = new Pool({
 });
 
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "DD_gyminfo";
+// Separate organiser password for the Mini Challenge registrations list.
+const MINI_ADMIN_PASSWORD = process.env.MINI_ADMIN_PASSWORD || "DD_mini";
 
 // ---- Schema: created automatically on boot, no manual SQL needed ----
 async function initSchema() {
@@ -504,7 +506,7 @@ app.post("/api/mini-challenge/verify", async (req, res) => {
 });
 
 app.get("/api/mini-challenge", async (req, res) => {
-  if (req.query.password !== ADMIN_PASSWORD) {
+  if (req.query.password !== MINI_ADMIN_PASSWORD) {
     return res.status(401).json({ success: false, error: "Unauthorized" });
   }
   try {
@@ -517,7 +519,7 @@ app.get("/api/mini-challenge", async (req, res) => {
 });
 
 app.delete("/api/mini-challenge/:id", async (req, res) => {
-  if (req.query.password !== ADMIN_PASSWORD) {
+  if (req.query.password !== MINI_ADMIN_PASSWORD) {
     return res.status(401).json({ success: false, error: "Unauthorized" });
   }
   try {
