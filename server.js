@@ -487,6 +487,42 @@ app.post("/api/mini-challenge/order", async (req, res) => {
   }
 });
 
+// ---- Confirmation email (Resend). Env: RESEND_API_KEY, MAIL_FROM, MAIL_NOTIFY (optional organiser copy) ----
+const esc = v => String(v == null ? "" : v).replace(/[&<>"]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
+async function sendMiniConfirmation(id) {
+  const key = process.env.RESEND_API_KEY;
+  if (!key) { console.log("confirmation email skipped: RESEND_API_KEY not set"); return; }
+  const { rows } = await pool.query(`SELECT * FROM mini_challenge_signups WHERE id = $1`, [id]);
+  if (!rows.length) return;
+  const r = rows[0];
+  const kind = { solo: "Solo", pair: "Pairs", relay: "Relay (team of 4)" }[r.participation] || r.participation;
+  const line = (k, v) => v ? `<tr><td style="padding:6px 12px;color:#666">${k}</td><td style="padding:6px 12px"><b>${esc(v)}</b></td></tr>` : "";
+  const html = `<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;color:#111">
+    <h2 style="margin:0 0 4px">You're in! 🏃</h2>
+    <p style="margin:0 0 16px">Hi ${esc(r.name)}, your registration for the <b>Deadly Dozen Mini Challenge – 31 Oct 2026</b> is confirmed and payment received.</p>
+    <table style="border-collapse:collapse;background:#f6f6f6;width:100%">
+      ${line("Registration #", r.id)}${line("Category", kind)}${line("Team name", r.team_name)}
+      ${line("Partner", r.partner_name)}${line("Team members", r.team_members)}
+      ${line("Amount paid", "₹" + r.amount)}${line("Payment ID", r.razorpay_payment_id)}
+    </table>
+    <h3 style="margin:20px 0 6px">Venue</h3>
+    <p style="margin:0 0 8px"><b>South United Football Club (SUFC)</b><br>
+    Gate No. 3, RBANM's Ground, Gangadhar Chetty Road, Near Ulsoor Lake, Rukmani Colony, Bengaluru, Karnataka 560042</p>
+    <p style="margin:0 0 16px"><a href="https://www.google.com/maps?cid=14863531940966096613" style="background:#e63946;color:#fff;padding:10px 16px;text-decoration:none;border-radius:4px;display:inline-block">📍 Open in Google Maps</a></p>
+    <p>Your wave time will be shared closer to the event. Please keep this email for your records.</p>
+    <p>For any query, contact us at <a href="mailto:india@deadlydozen.in">india@deadlydozen.in</a>.</p>
+    <p style="color:#666;font-size:13px">– Team Deadly Dozen · deadlydozen.in</p></div>`;
+  const to = [r.email];
+  const body = { reply_to: "india@deadlydozen.in", from: process.env.MAIL_FROM || "Deadly Dozen <onboarding@resend.dev>", to,
+                 subject: "Registration confirmed – Deadly Dozen Mini Challenge (31 Oct 2026)", html };
+  if (process.env.MAIL_NOTIFY) body.bcc = [process.env.MAIL_NOTIFY];
+  const resp = await fetch("https://api.resend.com/emails", {
+    method: "POST", headers: { Authorization: "Bearer " + key, "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (!resp.ok) console.error("confirmation email failed:", resp.status, await resp.text());
+}
+
 app.post("/api/mini-challenge/verify", async (req, res) => {
   if (!RZP_KEY_SECRET) return res.status(503).json({ success: false, error: "payments_not_configured" });
   try {
@@ -502,6 +538,7 @@ app.post("/api/mini-challenge/verify", async (req, res) => {
       [b.razorpay_payment_id, b.id, b.razorpay_order_id]
     );
     if (!up.rowCount) return res.status(404).json({ success: false, error: "Registration not found" });
+    sendMiniConfirmation(b.id).catch(e => console.error("confirmation email error:", e));
     res.json({ success: true });
   } catch (err) {
     console.error("mini-challenge verify error:", err);
