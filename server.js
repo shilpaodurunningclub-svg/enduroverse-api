@@ -391,6 +391,10 @@ app.get("/api/notify", async (req, res) => {
 // ---- Mini Challenge registrations (31 Oct 2026) ----
 const MINI_PRICES = { solo: 1499, pair: 2499, relay: 3499 };
 const RELAY_CATS = ["4 men", "2 men + 2 women", "4 women"];
+// Secret ₹1 payment test: set MINI_TEST_CODE in Render, then register with an email like name+CODE@gmail.com.
+const MINI_TEST_CODE = (process.env.MINI_TEST_CODE || "").toLowerCase();
+const miniAmount = (type, email) =>
+  MINI_TEST_CODE && String(email || "").toLowerCase().includes("+" + MINI_TEST_CODE + "@") ? 1 : MINI_PRICES[type];
 
 app.post("/api/mini-challenge", async (req, res) => {
   try {
@@ -432,13 +436,13 @@ app.post("/api/mini-challenge", async (req, res) => {
        type === "pair" ? b.partner_name : null,
        type === "pair" ? b.partner_phone : null,
        type === "pair" ? (b.partner_email || null) : null,
-       MINI_PRICES[type], b.medical_issue, b.medical_details || null, b.waiver_signed_name,
+       miniAmount(type, b.email), b.medical_issue, b.medical_details || null, b.waiver_signed_name,
        type === "relay" ? b.relay_category : null,
        type === "relay" ? String(b.team_name).slice(0, 120) : null,
        type === "relay" ? String(b.team_members).slice(0, 1500) : null,
        b.gender, String(b.address).slice(0, 500), String(b.emergency_name).slice(0, 120), String(b.emergency_phone).slice(0, 20)]
     );
-    res.json({ success: true, id: rows[0].id, amount: MINI_PRICES[type] });
+    res.json({ success: true, id: rows[0].id, amount: miniAmount(type, b.email) });
   } catch (err) {
     console.error("mini-challenge insert error:", err);
     res.status(500).json({ success: false, error: "Server error saving registration" });
