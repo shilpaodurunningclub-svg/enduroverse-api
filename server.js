@@ -411,7 +411,7 @@ app.get("/api/notify", async (req, res) => {
 // ---- Mini Challenge registrations (31 Oct 2026) ----
 const MINI_PRICES = { solo: 1499, pair: 2499, relay: 3499 };
 const RELAY_CATS = ["4 men", "2 men + 2 women", "4 women"];
-const PAIR_CATS = ["Men's doubles", "Women's doubles", "Mixed doubles"];
+const PAIR_CATS = ["Male doubles", "Female doubles", "Mixed doubles"];
 // Secret ₹1 payment test: set MINI_TEST_CODE in Render, then register with an email like name+CODE@gmail.com.
 const MINI_TEST_CODE = (process.env.MINI_TEST_CODE || "").toLowerCase();
 const miniAmount = (type, email) =>
@@ -468,7 +468,7 @@ app.post("/api/mini-challenge", async (req, res) => {
     }
     if (type === "pair") {
       if (!PAIR_CATS.includes(b.pair_category)) {
-        return res.status(400).json({ success: false, error: "Choose Men's, Women's or Mixed doubles" });
+        return res.status(400).json({ success: false, error: "Choose Male, Female or Mixed doubles" });
       }
       if (!b.team_name || !String(b.team_name).trim()) {
         return res.status(400).json({ success: false, error: "Team name is required for pairs" });
@@ -478,7 +478,7 @@ app.post("/api/mini-challenge", async (req, res) => {
       }
       const pg = [b.gender, b.partner_gender];
       const men = pg.filter(x => x === "Male").length;
-      const want = b.pair_category === "Men's doubles" ? 2 : b.pair_category === "Women's doubles" ? 0 : 1;
+      const want = b.pair_category === "Male doubles" ? 2 : b.pair_category === "Female doubles" ? 0 : 1;
       if (men !== want) {
         return res.status(400).json({ success: false, error: "The two genders do not match " + b.pair_category });
       }
