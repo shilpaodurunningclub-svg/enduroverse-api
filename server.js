@@ -101,7 +101,8 @@ async function initSchema() {
     ALTER TABLE mini_challenge_signups
       ADD COLUMN IF NOT EXISTS relay_category TEXT,
       ADD COLUMN IF NOT EXISTS team_name TEXT,
-      ADD COLUMN IF NOT EXISTS team_members TEXT;
+      ADD COLUMN IF NOT EXISTS team_members TEXT,
+      ADD COLUMN IF NOT EXISTS partner_gender TEXT;
   `);
 
   // Gender, address and emergency contact for Mini Challenge (safe to re-run).
@@ -410,6 +411,7 @@ app.get("/api/notify", async (req, res) => {
 // ---- Mini Challenge registrations (31 Oct 2026) ----
 const MINI_PRICES = { solo: 1499, pair: 2499, relay: 3499 };
 const RELAY_CATS = ["4 men", "2 men + 2 women", "4 women"];
+const PAIR_CATS = ["Men's doubles", "Women's doubles", "Mixed doubles"];
 // Secret ₹1 payment test: set MINI_TEST_CODE in Render, then register with an email like name+CODE@gmail.com.
 const MINI_TEST_CODE = (process.env.MINI_TEST_CODE || "").toLowerCase();
 const miniAmount = (type, email) =>
@@ -464,6 +466,23 @@ app.post("/api/mini-challenge", async (req, res) => {
     if (type === "pair" && (!b.partner_name || !b.partner_phone)) {
       return res.status(400).json({ success: false, error: "Partner details required for pairs" });
     }
+    if (type === "pair") {
+      if (!PAIR_CATS.includes(b.pair_category)) {
+        return res.status(400).json({ success: false, error: "Choose Men's, Women's or Mixed doubles" });
+      }
+      if (!b.team_name || !String(b.team_name).trim()) {
+        return res.status(400).json({ success: false, error: "Team name is required for pairs" });
+      }
+      if (b.partner_gender !== "Male" && b.partner_gender !== "Female") {
+        return res.status(400).json({ success: false, error: "Please select your partner's gender" });
+      }
+      const pg = [b.gender, b.partner_gender];
+      const men = pg.filter(x => x === "Male").length;
+      const want = b.pair_category === "Men's doubles" ? 2 : b.pair_category === "Women's doubles" ? 0 : 1;
+      if (men !== want) {
+        return res.status(400).json({ success: false, error: "The two genders do not match " + b.pair_category });
+      }
+    }
     if (b.gender !== "Male" && b.gender !== "Female") {
       return res.status(400).json({ success: false, error: "Please select Male or Female" });
     }
@@ -498,18 +517,18 @@ app.post("/api/mini-challenge", async (req, res) => {
         (name, phone, email, participation, partner_name, partner_phone, partner_email,
          amount, medical_issue, medical_details, waiver_accepted, waiver_signed_name,
          relay_category, team_name, team_members, gender, address, emergency_name, emergency_phone,
-         coupon_code, discount_percent)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,true,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING id`,
+         coupon_code, discount_percent, partner_gender)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,true,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) RETURNING id`,
       [b.name, b.phone, b.email, type,
        type === "pair" ? b.partner_name : null,
        type === "pair" ? b.partner_phone : null,
        type === "pair" ? (b.partner_email || null) : null,
        amount, b.medical_issue, b.medical_details || null, b.waiver_signed_name,
-       type === "relay" ? b.relay_category : null,
-       type === "relay" ? String(b.team_name).slice(0, 120) : null,
+       type === "relay" ? b.relay_category : type === "pair" ? b.pair_category : null,
+       (type === "relay" || type === "pair") ? String(b.team_name).slice(0, 120) : null,
        type === "relay" ? String(b.team_members).slice(0, 1500) : null,
        b.gender, String(b.address).slice(0, 500), String(b.emergency_name).slice(0, 120), String(b.emergency_phone).slice(0, 20),
-       couponCode, couponPct]
+       couponCode, couponPct, type === "pair" ? b.partner_gender : null]
     );
     res.json({ success: true, id: rows[0].id, amount, coupon_code: couponCode, discount_percent: couponPct });
   } catch (err) {
@@ -574,7 +593,7 @@ async function sendMiniConfirmation(id) {
   const { rows } = await pool.query(`SELECT * FROM mini_challenge_signups WHERE id = $1`, [id]);
   if (!rows.length) return;
   const r = rows[0];
-  const kind = { solo: "Solo", pair: "Pairs", relay: "Relay (team of 4)" }[r.participation] || r.participation;
+  const kind = ({ solo: "Solo", pair: "Pairs", relay: "Relay (team of 4)" }[r.participation] || r.participation) + (r.participation === "pair" && r.relay_category ? " – " + r.relay_category : "");
   const line = (k, v) => v ? `<tr><td style="padding:6px 12px;color:#666">${k}</td><td style="padding:6px 12px"><b>${esc(v)}</b></td></tr>` : "";
   const html = `<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;color:#111">
     <h2 style="margin:0 0 4px">You're in! 🏃</h2>
