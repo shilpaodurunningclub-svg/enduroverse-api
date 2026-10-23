@@ -409,7 +409,8 @@ app.get("/api/notify", async (req, res) => {
 });
 
 // ---- Mini Challenge registrations (31 Oct 2026) ----
-const MINI_PRICES = { solo: 1499, pair: 2499, relay: 3499 };
+const MINI_PRICES = { solo: 1499, pair: 2499, relay: 3499, gym: 3499 };
+const isTeamType = t => t === "relay" || t === "gym";
 const RELAY_CATS = ["4 men", "2 men + 2 women", "4 women"];
 const PAIR_CATS = ["Male doubles", "Female doubles", "Mixed doubles"];
 // Secret ₹1 payment test: set MINI_TEST_CODE in Render, then register with an email like name+CODE@gmail.com.
@@ -444,7 +445,7 @@ app.post("/api/mini-challenge/coupon", async (req, res) => {
   try {
     if (couponLimited(req.ip)) return res.status(429).json({ success: false, error: "Too many attempts. Please wait a minute." });
     const b = req.body || {};
-    const type = ["solo", "pair", "relay"].includes(b.participation) ? b.participation : null;
+    const type = ["solo", "pair", "relay", "gym"].includes(b.participation) ? b.participation : null;
     const r = await lookupCoupon(b.code);
     if (!r.ok) return res.status(400).json({ success: false, error: r.error });
     const base = type ? MINI_PRICES[type] : null;
@@ -459,7 +460,7 @@ app.post("/api/mini-challenge/coupon", async (req, res) => {
 app.post("/api/mini-challenge", async (req, res) => {
   try {
     const b = req.body || {};
-    const type = ["solo", "pair", "relay"].includes(b.participation) ? b.participation : null;
+    const type = ["solo", "pair", "relay", "gym"].includes(b.participation) ? b.participation : null;
     if (!b.name || !b.phone || !b.email || !type) {
       return res.status(400).json({ success: false, error: "Missing required fields" });
     }
@@ -489,7 +490,7 @@ app.post("/api/mini-challenge", async (req, res) => {
     if (!b.address || !b.emergency_name || !b.emergency_phone) {
       return res.status(400).json({ success: false, error: "Address and emergency contact are required" });
     }
-    if (type === "relay") {
+    if (isTeamType(type)) {
       if (!RELAY_CATS.includes(b.relay_category)) {
         return res.status(400).json({ success: false, error: "Choose a relay team category" });
       }
@@ -524,9 +525,9 @@ app.post("/api/mini-challenge", async (req, res) => {
        type === "pair" ? b.partner_phone : null,
        type === "pair" ? (b.partner_email || null) : null,
        amount, b.medical_issue, b.medical_details || null, b.waiver_signed_name,
-       type === "relay" ? b.relay_category : type === "pair" ? b.pair_category : null,
-       (type === "relay" || type === "pair") ? String(b.team_name).slice(0, 120) : null,
-       type === "relay" ? String(b.team_members).slice(0, 1500) : null,
+       isTeamType(type) ? b.relay_category : type === "pair" ? b.pair_category : null,
+       (isTeamType(type) || type === "pair") ? String(b.team_name).slice(0, 120) : null,
+       isTeamType(type) ? String(b.team_members).slice(0, 1500) : null,
        b.gender, String(b.address).slice(0, 500), String(b.emergency_name).slice(0, 120), String(b.emergency_phone).slice(0, 20),
        couponCode, couponPct, type === "pair" ? b.partner_gender : null]
     );
@@ -593,7 +594,7 @@ async function sendMiniConfirmation(id) {
   const { rows } = await pool.query(`SELECT * FROM mini_challenge_signups WHERE id = $1`, [id]);
   if (!rows.length) return;
   const r = rows[0];
-  const kind = ({ solo: "Solo", pair: "Pairs", relay: "Relay (team of 4)" }[r.participation] || r.participation) + (r.participation === "pair" && r.relay_category ? " – " + r.relay_category : "");
+  const kind = ({ solo: "Solo", pair: "Pairs", relay: "Relay (team of 4)", gym: "Gym Warrior (team of 4)" }[r.participation] || r.participation) + (r.participation === "pair" && r.relay_category ? " – " + r.relay_category : "");
   const line = (k, v) => v ? `<tr><td style="padding:6px 12px;color:#666">${k}</td><td style="padding:6px 12px"><b>${esc(v)}</b></td></tr>` : "";
   const html = `<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;color:#111">
     <h2 style="margin:0 0 4px">You're in! 🏃</h2>
