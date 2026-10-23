@@ -10,7 +10,7 @@ const { Pool } = require("pg");
 const app = express();
 // Raised from 2mb to comfortably fit uploaded rule book / program PDFs,
 // which are sent as base64 JSON (base64 runs ~33% larger than the file).
-app.use(express.json({ limit: "20mb" }));
+app.use(express.json({ limit: "20mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
 
 // Basic CORS so the form (hosted elsewhere, e.g. Wix) can call this API.
 app.use((req, res, next) => {
@@ -656,11 +656,91 @@ app.post("/api/mini-challenge/verify", async (req, res) => {
     if (up.rows[0].coupon_code && up.rows[0].prev_status !== "paid") {
       await pool.query(`UPDATE mini_challenge_coupons SET used_count = used_count + 1 WHERE code = $1`, [up.rows[0].coupon_code]);
     }
-    sendMiniConfirmation(b.id).catch(e => console.error("confirmation email error:", e));
+    if (up.rows[0].prev_status !== "paid") sendMiniConfirmation(b.id).catch(e => console.error("confirmation email error:", e));
     res.json({ success: true });
   } catch (err) {
     console.error("mini-challenge verify error:", err);
     res.status(500).json({ success: false, error: "Server error verifying payment" });
+  }
+});
+
+// ---- Safety net: confirm payments even if the customer's browser never reported back ----
+// Marks a registration paid (once), counts its coupon, and sends the confirmation email.
+async function markMiniPaid(orderId, paymentId, paidPaise) {
+  const up = await pool.query(
+    `UPDATE mini_challenge_signups SET payment_status = 'paid', razorpay_payment_id = $1, paid_at = now()
+     WHERE razorpay_order_id = $2 AND payment_status <> 'paid' AND ($3::int IS NULL OR amount * 100 = $3::int)
+     RETURNING id, coupon_code`,
+    [paymentId, orderId, paidPaise == null ? null : paidPaise]
+  );
+  if (!up.rowCount) return false;
+  const r = up.rows[0];
+  if (r.coupon_code) await pool.query(`UPDATE mini_challenge_coupons SET used_count = used_count + 1 WHERE code = $1`, [r.coupon_code]);
+  console.log("mini-challenge #" + r.id + " marked paid via Razorpay check (" + paymentId + ")");
+  sendMiniConfirmation(r.id).catch(e => console.error("confirmation email error:", e));
+  return true;
+}
+
+// Asks Razorpay whether an order has a captured payment; marks the registration paid if so.
+async function reconcileOrder(orderId) {
+  const auth = Buffer.from(RZP_KEY_ID + ":" + RZP_KEY_SECRET).toString("base64");
+  const rz = await fetch("https://api.razorpay.com/v1/orders/" + encodeURIComponent(orderId) + "/payments", { headers: { Authorization: "Basic " + auth } });
+  const d = await rz.json();
+  if (!rz.ok) throw new Error((d.error && d.error.description) || ("Razorpay HTTP " + rz.status));
+  const ok = (d.items || []).find(p => p.status === "captured");
+  if (!ok) return false;
+  return await markMiniPaid(orderId, ok.id, ok.amount);
+}
+
+async function reconcilePending(days, cap) {
+  if (!RZP_KEY_ID || !RZP_KEY_SECRET) return { checked: 0, updated: 0, error: "payments_not_configured" };
+  const { rows } = await pool.query(
+    `SELECT id, razorpay_order_id FROM mini_challenge_signups
+     WHERE payment_status <> 'paid' AND razorpay_order_id IS NOT NULL AND submitted_at > now() - ($1 || ' days')::interval
+     ORDER BY submitted_at DESC LIMIT $2`, [String(days), cap]);
+  let updated = 0, failed = 0;
+  for (const r of rows) {
+    try { if (await reconcileOrder(r.razorpay_order_id)) updated++; }
+    catch (e) { failed++; console.error("reconcile #" + r.id + " failed:", e.message); }
+  }
+  return { checked: rows.length, updated, failed };
+}
+
+// Every 5 minutes, check recent unpaid registrations with Razorpay.
+setInterval(() => { reconcilePending(3, 60).catch(e => console.error("auto reconcile error:", e.message)); }, 5 * 60 * 1000);
+
+// Organiser button: check all unpaid registrations (last 30 days) with Razorpay now.
+app.post("/api/mini-challenge-reconcile", async (req, res) => {
+  if (req.query.password !== MINI_ADMIN_PASSWORD) return res.status(401).json({ success: false, error: "Unauthorized" });
+  try {
+    const r = await reconcilePending(30, 150);
+    if (r.error) return res.status(503).json({ success: false, error: r.error });
+    res.json({ success: true, ...r });
+  } catch (err) {
+    console.error("reconcile error:", err);
+    res.status(500).json({ success: false, error: "Server error" });
+  }
+});
+
+// Razorpay webhook (optional): set RAZORPAY_WEBHOOK_SECRET in Render and add
+// https://enduroverse-api.onrender.com/api/razorpay-webhook in Razorpay with events payment.captured and order.paid.
+app.post("/api/razorpay-webhook", async (req, res) => {
+  const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
+  if (!secret) return res.status(503).json({ success: false, error: "webhook_not_configured" });
+  try {
+    const sig = req.get("x-razorpay-signature") || "";
+    const expected = crypto.createHmac("sha256", secret).update(req.rawBody || Buffer.from("")).digest("hex");
+    const a = Buffer.from(sig), b = Buffer.from(expected);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(400).json({ success: false, error: "bad signature" });
+    const ev = req.body || {};
+    const pay = ev.payload && ev.payload.payment && ev.payload.payment.entity;
+    if ((ev.event === "payment.captured" || ev.event === "order.paid") && pay && pay.order_id && pay.status === "captured") {
+      await markMiniPaid(pay.order_id, pay.id, pay.amount);
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error("razorpay webhook error:", err);
+    res.status(500).json({ success: false });
   }
 });
 
