@@ -156,6 +156,17 @@ async function initSchema() {
       updated_at TIMESTAMPTZ DEFAULT now()
     );
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS spectator_signups (
+      id SERIAL PRIMARY KEY,
+      ticket_code TEXT UNIQUE,
+      name TEXT, phone TEXT, email TEXT, city TEXT,
+      supporting_athlete BOOLEAN, athlete_name TEXT, relation TEXT,
+      party_size TEXT,
+      email_sent BOOLEAN DEFAULT false,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
 }
 
 app.get("/health", (req, res) => res.json({ ok: true }));
@@ -948,6 +959,120 @@ app.post("/api/settings/:key", async (req, res) => {
     console.error("settings write error:", err);
     res.status(500).json({ success: false, error: "Server error saving setting" });
   }
+});
+
+// ================= Spectator registration =================
+// Env (set on Render): SPECTATOR_EVENT_NAME, SPECTATOR_EVENT_DATE, SPECTATOR_VENUE, SPECTATOR_MAP_URL
+const SPEC_RELATIONS = ["Friend","Partner","Sibling","Parent","Family","Coach","Other"];
+const SPEC_PARTY = ["1 - Just me","2","3","4","5+"];
+const specHits = new Map();
+function specLimited(ip) {
+  const now = Date.now(), arr = (specHits.get(ip) || []).filter(t => now - t < 3600000);
+  arr.push(now); specHits.set(ip, arr); return arr.length > 10;
+}
+function newTicketCode() {
+  const A = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+  let c = ""; for (let i = 0; i < 6; i++) c += A[crypto.randomInt(A.length)];
+  return "DDS-" + c;
+}
+async function sendSpectatorTicket(id) {
+  const useSmtp = !!(process.env.SMTP_HOST || process.env.EMAIL_USER);
+  const key = process.env.RESEND_API_KEY;
+  if (!useSmtp && !key) { console.log("spectator email skipped: no mail config"); return; }
+  const { rows } = await pool.query(`SELECT * FROM spectator_signups WHERE id = $1`, [id]);
+  if (!rows.length) return;
+  const r = rows[0];
+  const evName = process.env.SPECTATOR_EVENT_NAME || "Deadly Dozen India";
+  const evDate = process.env.SPECTATOR_EVENT_DATE || "Date to be announced";
+  const venue = process.env.SPECTATOR_VENUE || "Venue details will be shared shortly";
+  const mapUrl = process.env.SPECTATOR_MAP_URL || (process.env.SPECTATOR_VENUE ? "https://www.google.com/maps/search/?api=1&query=" + encodeURIComponent(process.env.SPECTATOR_VENUE) : "");
+  const QRCode = require("qrcode");
+  const qrBuf = await QRCode.toBuffer(r.ticket_code, { width: 320, margin: 2 });
+  const line = (k, v) => v ? `<tr><td style="padding:6px 12px;color:#666">${k}</td><td style="padding:6px 12px"><b>${esc(v)}</b></td></tr>` : "";
+  const html = `<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;color:#111">
+    <h2 style="margin:0 0 4px">Your seat is reserved 🎟️</h2>
+    <p style="margin:0 0 16px">Hi ${esc(r.name)}, here is your E-Ticket for <b>${esc(evName)}</b>. Show the QR code at the gate.</p>
+    <div style="text-align:center;margin:16px 0"><img src="cid:ticketqr" width="220" height="220" alt="QR ${esc(r.ticket_code)}"><br><b style="font-size:20px;letter-spacing:2px">${esc(r.ticket_code)}</b></div>
+    <table style="border-collapse:collapse;background:#f6f6f6;width:100%">
+      ${line("Name", r.name)}${line("Admits", r.party_size)}${line("Supporting", r.athlete_name)}${line("Event", evName)}${line("Date", evDate)}
+    </table>
+    <h3 style="margin:20px 0 6px">Venue</h3>
+    <p style="margin:0 0 8px"><b>${esc(venue)}</b></p>
+    ${mapUrl ? `<p style="margin:0 0 16px"><a href="${esc(mapUrl)}" style="background:#e63946;color:#fff;padding:10px 16px;text-decoration:none;border-radius:4px;display:inline-block">📍 Open venue map</a></p>` : ""}
+    <p>Questions? Write to <a href="mailto:india@deadlydozen.in">india@deadlydozen.in</a>.</p>
+    <p style="color:#666;font-size:13px">– Team Deadly Dozen · deadlydozen.in</p></div>`;
+  const subject = `Your E-Ticket – ${evName} Spectator (${r.ticket_code})`;
+  if (useSmtp) {
+    const nodemailer = require("nodemailer");
+    const port = parseInt(process.env.SMTP_PORT || "587", 10);
+    const user = process.env.SMTP_USER || process.env.EMAIL_USER;
+    const pass = process.env.SMTP_PASS || process.env.EMAIL_PASS;
+    const tx = nodemailer.createTransport({ host: process.env.SMTP_HOST || "smtp.gmail.com", port, secure: port === 465, auth: user ? { user, pass } : undefined });
+    await tx.sendMail({
+      from: process.env.MAIL_FROM || process.env.EMAIL_FROM || user, to: r.email,
+      bcc: process.env.MAIL_NOTIFY || undefined, replyTo: "india@deadlydozen.in", subject, html,
+      attachments: [{ filename: r.ticket_code + ".png", content: qrBuf, cid: "ticketqr" }]
+    });
+  } else {
+    const body = { reply_to: "india@deadlydozen.in", from: process.env.MAIL_FROM || "Deadly Dozen <onboarding@resend.dev>",
+      to: [r.email], subject, html: html.replace("cid:ticketqr", "cid:ticketqr"),
+      attachments: [{ filename: r.ticket_code + ".png", content: qrBuf.toString("base64"), content_id: "ticketqr" }] };
+    const resp = await fetch("https://api.resend.com/emails", { method: "POST",
+      headers: { Authorization: "Bearer " + key, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (!resp.ok) throw new Error("resend " + resp.status + " " + await resp.text());
+  }
+  await pool.query(`UPDATE spectator_signups SET email_sent = true WHERE id = $1`, [id]);
+  console.log("spectator ticket email sent to", r.email);
+}
+
+app.post("/api/spectator", async (req, res) => {
+  try {
+    if (specLimited(req.ip)) return res.status(429).json({ success: false, error: "Too many attempts. Please try again later." });
+    const b = req.body || {};
+    if (b.website) return res.json({ success: true }); // honeypot
+    const name = String(b.name || "").trim().slice(0, 120);
+    const phone = String(b.phone || "").replace(/[^\d+]/g, "").slice(-13);
+    const email = String(b.email || "").trim().toLowerCase().slice(0, 160);
+    const city = String(b.city || "").trim().slice(0, 80);
+    const party = String(b.party_size || "");
+    const support = b.supporting_athlete === true || b.supporting_athlete === "yes";
+    const athlete = String(b.athlete_name || "").trim().slice(0, 120);
+    const relation = String(b.relation || "");
+    if (!name) return res.status(400).json({ success: false, error: "Please enter your full name." });
+    if (!/^(\+?91)?[6-9]\d{9}$/.test(phone)) return res.status(400).json({ success: false, error: "Please enter a valid 10-digit mobile number." });
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ success: false, error: "Please enter a valid email." });
+    if (!city) return res.status(400).json({ success: false, error: "Please enter your city." });
+    if (!SPEC_PARTY.includes(party)) return res.status(400).json({ success: false, error: "Please choose how many people are coming." });
+    if (support && relation && !SPEC_RELATIONS.includes(relation)) return res.status(400).json({ success: false, error: "Invalid relation." });
+    let code, ins;
+    for (let i = 0; i < 5 && !ins; i++) {
+      code = newTicketCode();
+      try {
+        ins = await pool.query(
+          `INSERT INTO spectator_signups (ticket_code,name,phone,email,city,supporting_athlete,athlete_name,relation,party_size)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+          [code, name, phone, email, city, support, support ? athlete : null, support ? relation : null, party]);
+      } catch (e) { if (e.code !== "23505") throw e; }
+    }
+    if (!ins) throw new Error("could not allocate ticket code");
+    sendSpectatorTicket(ins.rows[0].id).catch(e => console.error("spectator email error:", e));
+    res.json({ success: true, ticket_code: code });
+  } catch (err) {
+    console.error("spectator error:", err);
+    res.status(500).json({ success: false, error: "Server error. Please try again." });
+  }
+});
+
+app.get("/api/spectators", async (req, res) => {
+  if (req.query.password !== MINI_ADMIN_PASSWORD) return res.status(401).json({ success: false, error: "Unauthorized" });
+  const { rows } = await pool.query(`SELECT * FROM spectator_signups ORDER BY id DESC`);
+  if (req.query.format === "csv") {
+    const cols = ["ticket_code","name","phone","email","city","supporting_athlete","athlete_name","relation","party_size","email_sent","created_at"];
+    const q = v => '"' + String(v == null ? "" : v).replace(/"/g, '""') + '"';
+    res.set("Content-Type", "text/csv");
+    return res.send([cols.join(",")].concat(rows.map(r => cols.map(c => q(r[c])).join(","))).join("\n"));
+  }
+  res.json({ success: true, spectators: rows });
 });
 
 const PORT = process.env.PORT || 3000;
