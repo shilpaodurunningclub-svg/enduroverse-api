@@ -965,6 +965,7 @@ app.post("/api/settings/:key", async (req, res) => {
 // Env (set on Render): SPECTATOR_EVENT_NAME, SPECTATOR_EVENT_DATE, SPECTATOR_VENUE, SPECTATOR_MAP_URL
 const SPEC_RELATIONS = ["Friend","Partner","Sibling","Parent","Family","Coach","Other"];
 const SPEC_PARTY = ["1 - Just me","2","3","4","5+"];
+const SPEC_ADMIN_PASSWORD = process.env.SPECTATOR_ADMIN_PASSWORD || "oduadmin";
 const specHits = new Map();
 function specLimited(ip) {
   const now = Date.now(), arr = (specHits.get(ip) || []).filter(t => now - t < 3600000);
@@ -1064,7 +1065,7 @@ app.post("/api/spectator", async (req, res) => {
 });
 
 app.get("/api/spectators", async (req, res) => {
-  if (req.query.password !== MINI_ADMIN_PASSWORD) return res.status(401).json({ success: false, error: "Unauthorized" });
+  if (req.query.password !== SPEC_ADMIN_PASSWORD) return res.status(401).json({ success: false, error: "Unauthorized" });
   const { rows } = await pool.query(`SELECT * FROM spectator_signups ORDER BY id DESC`);
   if (req.query.format === "csv") {
     const cols = ["ticket_code","name","phone","email","city","supporting_athlete","athlete_name","relation","party_size","email_sent","created_at"];
