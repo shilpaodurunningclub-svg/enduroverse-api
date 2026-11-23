@@ -176,6 +176,8 @@ async function initSchema() {
   await pool.query(`ALTER TABLE spectator_signups ADD COLUMN IF NOT EXISTS referred_by TEXT`);
   await pool.query(`CREATE TABLE IF NOT EXISTS wave_schedule (id SERIAL PRIMARY KEY, category TEXT, wave INT, start_time TEXT, mix TEXT, names JSONB)`);
   await pool.query(`CREATE TABLE IF NOT EXISTS wave_phones (phone TEXT, name TEXT)`);
+  await pool.query(`ALTER TABLE wave_phones ADD COLUMN IF NOT EXISTS bib TEXT`);
+  await pool.query(`ALTER TABLE wave_phones ADD COLUMN IF NOT EXISTS qr TEXT`);
 }
 
 app.get("/health", (req, res) => res.json({ ok: true }));
@@ -1157,12 +1159,12 @@ app.post("/api/waves/schedule", async (req, res) => {
 app.post("/api/waves/phones", async (req, res) => {
   if (req.query.password !== SPEC_ADMIN_PASSWORD) return res.status(401).json({ success: false, error: "Unauthorized" });
   const rows = Array.isArray((req.body || {}).rows) ? req.body.rows : [];
-  const clean = rows.map(r => ({ phone: normPhone(r.mobile), name: String(r.name || "").trim() })).filter(r => r.phone.length === 10 && r.name);
+  const clean = rows.map(r => ({ phone: normPhone(r.mobile), name: String(r.name || "").trim(), bib: String(r.bib || "").trim().slice(0, 20), qr: String(r.qr || "").trim().slice(0, 300) })).filter(r => r.phone.length === 10 && r.name);
   const sched = await pool.query(`SELECT names FROM wave_schedule`);
   const known = new Set(); sched.rows.forEach(r => (r.names || []).forEach(n => known.add(normName(n))));
   const unmatched = [...new Set(clean.filter(r => !known.has(normName(r.name))).map(r => r.name))];
   await pool.query("DELETE FROM wave_phones");
-  for (const r of clean) await pool.query(`INSERT INTO wave_phones (phone, name) VALUES ($1,$2)`, [r.phone, r.name]);
+  for (const r of clean) await pool.query(`INSERT INTO wave_phones (phone, name, bib, qr) VALUES ($1,$2,$3,$4)`, [r.phone, r.name, r.bib || null, /^https:\/\/www\.novarace\.in\//.test(r.qr) ? r.qr : null]);
   res.json({ success: true, saved: clean.length, skipped: rows.length - clean.length, unmatched });
 });
 app.post("/api/find-wave", async (req, res) => {
@@ -1173,10 +1175,10 @@ app.post("/api/find-wave", async (req, res) => {
     const phone = normPhone((req.body || {}).mobile);
     if (phone.length !== 10) return res.status(400).json({ success: false, error: "Please enter your 10-digit mobile number." });
     const { rows } = await pool.query(
-      `SELECT DISTINCT ON (s.id, p.name) p.name, s.category, s.wave, s.start_time FROM wave_phones p
+      `SELECT DISTINCT ON (s.id, p.name) p.name, p.bib, p.qr, s.category, s.wave, s.start_time FROM wave_phones p
        JOIN wave_schedule s ON EXISTS (SELECT 1 FROM jsonb_array_elements_text(s.names) n WHERE lower(trim(n)) = lower(trim(p.name)))
        WHERE p.phone = $1`, [phone]);
-    res.json({ success: true, results: rows.map(r => ({ name: r.name, category: r.category, wave: r.wave, start: r.start_time, arrive_by: arriveBy(r.start_time) })) });
+    res.json({ success: true, results: rows.map(r => ({ name: r.name, bib: r.bib || "", qr: r.qr || "", category: r.category, wave: r.wave, start: r.start_time, arrive_by: arriveBy(r.start_time) })) });
   } catch (err) {
     console.error("find-wave error:", err);
     res.status(500).json({ success: false, error: "Server error. Please try again." });
