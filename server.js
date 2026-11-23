@@ -172,6 +172,7 @@ async function initSchema() {
       created_at TIMESTAMPTZ DEFAULT now()
     );
   `);
+  await pool.query(`ALTER TABLE spectator_signups ADD COLUMN IF NOT EXISTS guests JSONB`);
 }
 
 app.get("/health", (req, res) => res.json({ ok: true }));
@@ -998,12 +999,14 @@ async function sendSpectatorTicket(id) {
   const codes = Array.from({ length: n }, (_, i) => n === 1 ? r.ticket_code : r.ticket_code + "-" + (i + 1));
   const qrBufs = await Promise.all(codes.map(c => QRCode.toBuffer(c, { width: 320, margin: 2 })));
   const line = (k, v) => v ? `<tr><td style="padding:6px 12px;color:#666">${k}</td><td style="padding:6px 12px"><b>${esc(v)}</b></td></tr>` : "";
+  const holders = [r.name].concat((r.guests || []).map(g => g.name));
   const tickets = codes.map((c, i) => `<div style="text-align:center;margin:14px 0;padding:14px;border:2px dashed #999;border-radius:8px">
       <div style="color:#666;font-size:13px">${n === 1 ? "ADMITS 1 PERSON" : "TICKET " + (i + 1) + " OF " + n + " · ADMITS 1 PERSON"}</div>
+      <div style="font-size:16px;margin:4px 0"><b>${esc(holders[i] || ("Guest " + (i + 1)))}</b></div>
       <img src="cid:ticketqr${i}" width="200" height="200" alt="QR ${esc(c)}"><br><b style="font-size:18px;letter-spacing:2px">${esc(c)}</b></div>`).join("");
   const html = `<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;color:#111">
     <h2 style="margin:0 0 4px">Your seat${n > 1 ? "s are" : " is"} reserved 🎟️</h2>
-    <p style="margin:0 0 16px">Hi ${esc(r.name)}, here ${n > 1 ? "are your " + n + " E-Tickets" : "is your E-Ticket"} for <b>${esc(evName)}</b>. <b>One ticket admits one person</b> – each person must show their own QR code at the gate${n > 1 ? " (forward a ticket to each guest)" : ""}.</p>
+    <p style="margin:0 0 16px">Hi ${esc(r.name)}, here ${n > 1 ? "are your " + n + " E-Tickets" : "is your E-Ticket"} for <b>${esc(evName)}</b>. <b>One ticket admits one person</b> – each person must show their own QR code at the gate${n > 1 ? " (forward each guest their ticket)" : ""}.</p>
     ${tickets}
     <table style="border-collapse:collapse;background:#f6f6f6;width:100%">
       ${line("Booked by", r.name)}${line("Tickets", String(n))}${line("Supporting", r.athlete_name)}${line("Event", evName)}${line("Date", evDate)}
@@ -1056,14 +1059,27 @@ app.post("/api/spectator", async (req, res) => {
     if (!city) return res.status(400).json({ success: false, error: "Please enter your city." });
     if (!SPEC_PARTY.includes(party)) return res.status(400).json({ success: false, error: "Please choose how many people are coming." });
     if (support && relation && !SPEC_RELATIONS.includes(relation)) return res.status(400).json({ success: false, error: "Invalid relation." });
+    const n = partyCount(party);
+    let guests = [];
+    if (n > 1 && party !== "5+") {
+      const raw = Array.isArray(b.guests) ? b.guests : [];
+      for (let i = 0; i < n - 1; i++) {
+        const g = raw[i] || {};
+        const gn = String(g.name || "").trim().slice(0, 120);
+        const gp = String(g.phone || "").replace(/[^\d+]/g, "").slice(-13);
+        if (!gn) return res.status(400).json({ success: false, error: "Please enter the name of guest " + (i + 2) + "." });
+        if (!/^(\+?91)?[6-9]\d{9}$/.test(gp)) return res.status(400).json({ success: false, error: "Please enter a valid mobile number for guest " + (i + 2) + "." });
+        guests.push({ name: gn, phone: gp });
+      }
+    }
     let code, ins;
     for (let i = 0; i < 5 && !ins; i++) {
       code = newTicketCode();
       try {
         ins = await pool.query(
-          `INSERT INTO spectator_signups (ticket_code,name,phone,email,city,supporting_athlete,athlete_name,relation,party_size)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
-          [code, name, phone, email, city, support, support ? athlete : null, support ? relation : null, party]);
+          `INSERT INTO spectator_signups (ticket_code,name,phone,email,city,supporting_athlete,athlete_name,relation,party_size,guests)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+          [code, name, phone, email, city, support, support ? athlete : null, support ? relation : null, party, JSON.stringify(guests)]);
       } catch (e) { if (e.code !== "23505") throw e; }
     }
     if (!ins) throw new Error("could not allocate ticket code");
@@ -1079,7 +1095,8 @@ app.get("/api/spectators", async (req, res) => {
   if (req.query.password !== SPEC_ADMIN_PASSWORD) return res.status(401).json({ success: false, error: "Unauthorized" });
   const { rows } = await pool.query(`SELECT s.*, (SELECT count(*)::int FROM spectator_checkins c WHERE c.base = s.ticket_code) AS checked_in FROM spectator_signups s ORDER BY s.id DESC`);
   if (req.query.format === "csv") {
-    const cols = ["ticket_code","name","phone","email","city","supporting_athlete","athlete_name","relation","party_size","checked_in","email_sent","created_at"];
+    const cols = ["ticket_code","name","phone","email","city","supporting_athlete","athlete_name","relation","party_size","guests","checked_in","email_sent","created_at"];
+    rows.forEach(r => { r.guests = (r.guests || []).map(g => g.name + " " + g.phone).join("; "); });
     const q = v => '"' + String(v == null ? "" : v).replace(/"/g, '""') + '"';
     res.set("Content-Type", "text/csv");
     return res.send([cols.join(",")].concat(rows.map(r => cols.map(c => q(r[c])).join(","))).join("\n"));
@@ -1096,11 +1113,13 @@ app.post("/api/spectator/checkin", async (req, res) => {
     const m = code.match(/^(DDS-[A-Z0-9]{6})(?:-(\d{1,2}))?$/);
     if (!m) return res.json({ success: true, status: "invalid", message: "Not a Deadly Dozen ticket" });
     const base = m[1], idx = m[2] ? parseInt(m[2], 10) : null;
-    const { rows } = await pool.query(`SELECT name, party_size FROM spectator_signups WHERE ticket_code = $1`, [base]);
+    const { rows } = await pool.query(`SELECT name, party_size, guests FROM spectator_signups WHERE ticket_code = $1`, [base]);
     if (!rows.length) return res.json({ success: true, status: "invalid", message: "Ticket not found" });
     const n = partyCount(rows[0].party_size);
     if ((n === 1 && idx !== null) || (n > 1 && (idx === null || idx < 1 || idx > n)))
       return res.json({ success: true, status: "invalid", message: "Ticket not found" });
+    const holderName = (idx && idx > 1 && rows[0].guests && rows[0].guests[idx - 2]) ? rows[0].guests[idx - 2].name : rows[0].name;
+    rows[0].name = holderName;
     const ins = await pool.query(`INSERT INTO spectator_checkins (code, base) VALUES ($1, $2) ON CONFLICT (code) DO NOTHING RETURNING checked_at`, [code, base]);
     if (ins.rowCount) return res.json({ success: true, status: "valid", name: rows[0].name, code, message: "Valid – admit 1 person" });
     const prev = await pool.query(`SELECT checked_at FROM spectator_checkins WHERE code = $1`, [code]);
