@@ -173,6 +173,7 @@ async function initSchema() {
     );
   `);
   await pool.query(`ALTER TABLE spectator_signups ADD COLUMN IF NOT EXISTS guests JSONB`);
+  await pool.query(`ALTER TABLE spectator_signups ADD COLUMN IF NOT EXISTS referred_by TEXT`);
   await pool.query(`CREATE TABLE IF NOT EXISTS wave_schedule (id SERIAL PRIMARY KEY, category TEXT, wave INT, start_time TEXT, mix TEXT, names JSONB)`);
   await pool.query(`CREATE TABLE IF NOT EXISTS wave_phones (phone TEXT, name TEXT)`);
 }
@@ -1051,7 +1052,8 @@ app.post("/api/spectator", async (req, res) => {
     const phone = String(b.phone || "").replace(/[^\d+]/g, "").slice(-13);
     const email = String(b.email || "").trim().toLowerCase().slice(0, 160);
     const city = String(b.city || "").trim().slice(0, 80);
-    const party = String(b.party_size || "");
+    const party = String(b.party_size || "1 - Just me");
+    const referredBy = String(b.referred_by || "").trim().slice(0, 160);
     const support = b.supporting_athlete === true || b.supporting_athlete === "yes";
     const athlete = String(b.athlete_name || "").trim().slice(0, 120);
     const relation = String(b.relation || "");
@@ -1059,6 +1061,7 @@ app.post("/api/spectator", async (req, res) => {
     if (!/^(\+?91)?[6-9]\d{9}$/.test(phone)) return res.status(400).json({ success: false, error: "Please enter a valid 10-digit mobile number." });
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ success: false, error: "Please enter a valid email." });
     if (!city) return res.status(400).json({ success: false, error: "Please enter your city." });
+    if (!referredBy && !b.party_size) return res.status(400).json({ success: false, error: "Please tell us who invited or referred you (person, run club or gym)." });
     if (!SPEC_PARTY.includes(party)) return res.status(400).json({ success: false, error: "Please choose how many people are coming." });
     if (support && relation && !SPEC_RELATIONS.includes(relation)) return res.status(400).json({ success: false, error: "Invalid relation." });
     const n = partyCount(party);
@@ -1079,9 +1082,9 @@ app.post("/api/spectator", async (req, res) => {
       code = newTicketCode();
       try {
         ins = await pool.query(
-          `INSERT INTO spectator_signups (ticket_code,name,phone,email,city,supporting_athlete,athlete_name,relation,party_size,guests)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
-          [code, name, phone, email, city, support, support ? athlete : null, support ? relation : null, party, JSON.stringify(guests)]);
+          `INSERT INTO spectator_signups (ticket_code,name,phone,email,city,supporting_athlete,athlete_name,relation,party_size,guests,referred_by)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
+          [code, name, phone, email, city, support, support ? athlete : null, support ? relation : null, party, JSON.stringify(guests), referredBy]);
       } catch (e) { if (e.code !== "23505") throw e; }
     }
     if (!ins) throw new Error("could not allocate ticket code");
@@ -1097,7 +1100,7 @@ app.get("/api/spectators", async (req, res) => {
   if (req.query.password !== SPEC_ADMIN_PASSWORD) return res.status(401).json({ success: false, error: "Unauthorized" });
   const { rows } = await pool.query(`SELECT s.*, (SELECT count(*)::int FROM spectator_checkins c WHERE c.base = s.ticket_code) AS checked_in FROM spectator_signups s ORDER BY s.id DESC`);
   if (req.query.format === "csv") {
-    const cols = ["ticket_code","name","phone","email","city","supporting_athlete","athlete_name","relation","party_size","guests","checked_in","email_sent","created_at"];
+    const cols = ["ticket_code","name","phone","email","city","supporting_athlete","athlete_name","relation","party_size","guests","referred_by","checked_in","email_sent","created_at"];
     rows.forEach(r => { r.guests = (r.guests || []).map(g => g.name + " " + g.phone).join("; "); });
     const q = v => '"' + String(v == null ? "" : v).replace(/"/g, '""') + '"';
     res.set("Content-Type", "text/csv");
