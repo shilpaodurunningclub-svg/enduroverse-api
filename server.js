@@ -173,6 +173,8 @@ async function initSchema() {
     );
   `);
   await pool.query(`ALTER TABLE spectator_signups ADD COLUMN IF NOT EXISTS guests JSONB`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS wave_schedule (id SERIAL PRIMARY KEY, category TEXT, wave INT, start_time TEXT, mix TEXT, names JSONB)`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS wave_phones (phone TEXT, name TEXT)`);
 }
 
 app.get("/health", (req, res) => res.json({ ok: true }));
@@ -1127,6 +1129,54 @@ app.post("/api/spectator/checkin", async (req, res) => {
   } catch (err) {
     console.error("checkin error:", err);
     res.status(500).json({ success: false, error: "Server error" });
+  }
+});
+
+// ---- Find your wave (lookup by mobile; numbers are never returned) ----
+const waveHits = new Map();
+const normPhone = v => String(v || "").replace(/\D/g, "").slice(-10);
+const normName = v => String(v || "").toLowerCase().replace(/\s+/g, " ").trim();
+function arriveBy(t) {
+  const m = String(t).match(/(\d+):(\d+) (AM|PM)/); if (!m) return "";
+  let tot = ((+m[1]) % 12 + (m[3] === "PM" ? 12 : 0)) * 60 + (+m[2]) - 60;
+  const H = Math.floor(tot / 60), M = tot % 60;
+  return ((H % 12) || 12) + ":" + String(M).padStart(2, "0") + " " + (H >= 12 ? "PM" : "AM");
+}
+app.post("/api/waves/schedule", async (req, res) => {
+  if (req.query.password !== SPEC_ADMIN_PASSWORD) return res.status(401).json({ success: false, error: "Unauthorized" });
+  const waves = Array.isArray((req.body || {}).waves) ? req.body.waves : [];
+  if (!waves.length) return res.status(400).json({ success: false, error: "No waves" });
+  await pool.query("DELETE FROM wave_schedule");
+  for (const w of waves) await pool.query(`INSERT INTO wave_schedule (category, wave, start_time, mix, names) VALUES ($1,$2,$3,$4,$5)`,
+    [w.c, w.w, w.t, w.m || "", JSON.stringify(w.n || [])]);
+  res.json({ success: true, waves: waves.length });
+});
+app.post("/api/waves/phones", async (req, res) => {
+  if (req.query.password !== SPEC_ADMIN_PASSWORD) return res.status(401).json({ success: false, error: "Unauthorized" });
+  const rows = Array.isArray((req.body || {}).rows) ? req.body.rows : [];
+  const clean = rows.map(r => ({ phone: normPhone(r.mobile), name: String(r.name || "").trim() })).filter(r => r.phone.length === 10 && r.name);
+  const sched = await pool.query(`SELECT names FROM wave_schedule`);
+  const known = new Set(); sched.rows.forEach(r => (r.names || []).forEach(n => known.add(normName(n))));
+  const unmatched = [...new Set(clean.filter(r => !known.has(normName(r.name))).map(r => r.name))];
+  await pool.query("DELETE FROM wave_phones");
+  for (const r of clean) await pool.query(`INSERT INTO wave_phones (phone, name) VALUES ($1,$2)`, [r.phone, r.name]);
+  res.json({ success: true, saved: clean.length, skipped: rows.length - clean.length, unmatched });
+});
+app.post("/api/find-wave", async (req, res) => {
+  try {
+    const now = Date.now(), arr = (waveHits.get(req.ip) || []).filter(t => now - t < 3600000);
+    arr.push(now); waveHits.set(req.ip, arr);
+    if (arr.length > 30) return res.status(429).json({ success: false, error: "Too many searches. Please try again later." });
+    const phone = normPhone((req.body || {}).mobile);
+    if (phone.length !== 10) return res.status(400).json({ success: false, error: "Please enter your 10-digit mobile number." });
+    const { rows } = await pool.query(
+      `SELECT DISTINCT ON (s.id, p.name) p.name, s.category, s.wave, s.start_time FROM wave_phones p
+       JOIN wave_schedule s ON EXISTS (SELECT 1 FROM jsonb_array_elements_text(s.names) n WHERE lower(trim(n)) = lower(trim(p.name)))
+       WHERE p.phone = $1`, [phone]);
+    res.json({ success: true, results: rows.map(r => ({ name: r.name, category: r.category, wave: r.wave, start: r.start_time, arrive_by: arriveBy(r.start_time) })) });
+  } catch (err) {
+    console.error("find-wave error:", err);
+    res.status(500).json({ success: false, error: "Server error. Please try again." });
   }
 });
 
