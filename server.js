@@ -157,6 +157,11 @@ async function initSchema() {
     );
   `);
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS spectator_checkins (
+      code TEXT PRIMARY KEY, base TEXT, checked_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS spectator_signups (
       id SERIAL PRIMARY KEY,
       ticket_code TEXT UNIQUE,
@@ -964,7 +969,8 @@ app.post("/api/settings/:key", async (req, res) => {
 // ================= Spectator registration =================
 // Env (set on Render): SPECTATOR_EVENT_NAME, SPECTATOR_EVENT_DATE, SPECTATOR_VENUE, SPECTATOR_MAP_URL
 const SPEC_RELATIONS = ["Friend","Partner","Sibling","Parent","Family","Coach","Other"];
-const SPEC_PARTY = ["1 - Just me","2","3","4","5+"];
+const SPEC_PARTY = ["1 - Just me","2","3","4","5","6","7","8","9","10","5+"];
+const partyCount = v => v === "5+" ? 5 : (parseInt(v, 10) || 1);
 const SPEC_ADMIN_PASSWORD = process.env.SPECTATOR_ADMIN_PASSWORD || "oduadmin";
 const specHits = new Map();
 function specLimited(ip) {
@@ -988,14 +994,19 @@ async function sendSpectatorTicket(id) {
   const venue = process.env.SPECTATOR_VENUE || "Venue details will be shared shortly";
   const mapUrl = process.env.SPECTATOR_MAP_URL || (process.env.SPECTATOR_VENUE ? "https://www.google.com/maps/search/?api=1&query=" + encodeURIComponent(process.env.SPECTATOR_VENUE) : "");
   const QRCode = require("qrcode");
-  const qrBuf = await QRCode.toBuffer(r.ticket_code, { width: 320, margin: 2 });
+  const n = partyCount(r.party_size);
+  const codes = Array.from({ length: n }, (_, i) => n === 1 ? r.ticket_code : r.ticket_code + "-" + (i + 1));
+  const qrBufs = await Promise.all(codes.map(c => QRCode.toBuffer(c, { width: 320, margin: 2 })));
   const line = (k, v) => v ? `<tr><td style="padding:6px 12px;color:#666">${k}</td><td style="padding:6px 12px"><b>${esc(v)}</b></td></tr>` : "";
+  const tickets = codes.map((c, i) => `<div style="text-align:center;margin:14px 0;padding:14px;border:2px dashed #999;border-radius:8px">
+      <div style="color:#666;font-size:13px">${n === 1 ? "ADMITS 1 PERSON" : "TICKET " + (i + 1) + " OF " + n + " · ADMITS 1 PERSON"}</div>
+      <img src="cid:ticketqr${i}" width="200" height="200" alt="QR ${esc(c)}"><br><b style="font-size:18px;letter-spacing:2px">${esc(c)}</b></div>`).join("");
   const html = `<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;color:#111">
-    <h2 style="margin:0 0 4px">Your seat is reserved 🎟️</h2>
-    <p style="margin:0 0 16px">Hi ${esc(r.name)}, here is your E-Ticket for <b>${esc(evName)}</b>. Show the QR code at the gate.</p>
-    <div style="text-align:center;margin:16px 0"><img src="cid:ticketqr" width="220" height="220" alt="QR ${esc(r.ticket_code)}"><br><b style="font-size:20px;letter-spacing:2px">${esc(r.ticket_code)}</b></div>
+    <h2 style="margin:0 0 4px">Your seat${n > 1 ? "s are" : " is"} reserved 🎟️</h2>
+    <p style="margin:0 0 16px">Hi ${esc(r.name)}, here ${n > 1 ? "are your " + n + " E-Tickets" : "is your E-Ticket"} for <b>${esc(evName)}</b>. <b>One ticket admits one person</b> – each person must show their own QR code at the gate${n > 1 ? " (forward a ticket to each guest)" : ""}.</p>
+    ${tickets}
     <table style="border-collapse:collapse;background:#f6f6f6;width:100%">
-      ${line("Name", r.name)}${line("Admits", r.party_size)}${line("Supporting", r.athlete_name)}${line("Event", evName)}${line("Date", evDate)}
+      ${line("Booked by", r.name)}${line("Tickets", String(n))}${line("Supporting", r.athlete_name)}${line("Event", evName)}${line("Date", evDate)}
     </table>
     <h3 style="margin:20px 0 6px">Venue</h3>
     <p style="margin:0 0 8px"><b>${esc(venue)}</b></p>
@@ -1012,12 +1023,12 @@ async function sendSpectatorTicket(id) {
     await tx.sendMail({
       from: process.env.MAIL_FROM || process.env.EMAIL_FROM || user, to: r.email,
       bcc: process.env.MAIL_NOTIFY || undefined, replyTo: "india@deadlydozen.in", subject, html,
-      attachments: [{ filename: r.ticket_code + ".png", content: qrBuf, cid: "ticketqr" }]
+      attachments: qrBufs.map((b, i) => ({ filename: codes[i] + ".png", content: b, cid: "ticketqr" + i }))
     });
   } else {
     const body = { reply_to: "india@deadlydozen.in", from: process.env.MAIL_FROM || "Deadly Dozen <onboarding@resend.dev>",
-      to: [r.email], subject, html: html.replace("cid:ticketqr", "cid:ticketqr"),
-      attachments: [{ filename: r.ticket_code + ".png", content: qrBuf.toString("base64"), content_id: "ticketqr" }] };
+      to: [r.email], subject, html,
+      attachments: qrBufs.map((b, i) => ({ filename: codes[i] + ".png", content: b.toString("base64"), content_id: "ticketqr" + i })) };
     const resp = await fetch("https://api.resend.com/emails", { method: "POST",
       headers: { Authorization: "Bearer " + key, "Content-Type": "application/json" }, body: JSON.stringify(body) });
     if (!resp.ok) throw new Error("resend " + resp.status + " " + await resp.text());
@@ -1066,14 +1077,38 @@ app.post("/api/spectator", async (req, res) => {
 
 app.get("/api/spectators", async (req, res) => {
   if (req.query.password !== SPEC_ADMIN_PASSWORD) return res.status(401).json({ success: false, error: "Unauthorized" });
-  const { rows } = await pool.query(`SELECT * FROM spectator_signups ORDER BY id DESC`);
+  const { rows } = await pool.query(`SELECT s.*, (SELECT count(*)::int FROM spectator_checkins c WHERE c.base = s.ticket_code) AS checked_in FROM spectator_signups s ORDER BY s.id DESC`);
   if (req.query.format === "csv") {
-    const cols = ["ticket_code","name","phone","email","city","supporting_athlete","athlete_name","relation","party_size","email_sent","created_at"];
+    const cols = ["ticket_code","name","phone","email","city","supporting_athlete","athlete_name","relation","party_size","checked_in","email_sent","created_at"];
     const q = v => '"' + String(v == null ? "" : v).replace(/"/g, '""') + '"';
     res.set("Content-Type", "text/csv");
     return res.send([cols.join(",")].concat(rows.map(r => cols.map(c => q(r[c])).join(","))).join("\n"));
   }
   res.json({ success: true, spectators: rows });
+});
+
+// Gate check-in: validates a scanned ticket code once. POST { password, code }
+app.post("/api/spectator/checkin", async (req, res) => {
+  try {
+    const b = req.body || {};
+    if (b.password !== SPEC_ADMIN_PASSWORD) return res.status(401).json({ success: false, error: "Unauthorized" });
+    const code = String(b.code || "").trim().toUpperCase();
+    const m = code.match(/^(DDS-[A-Z0-9]{6})(?:-(\d{1,2}))?$/);
+    if (!m) return res.json({ success: true, status: "invalid", message: "Not a Deadly Dozen ticket" });
+    const base = m[1], idx = m[2] ? parseInt(m[2], 10) : null;
+    const { rows } = await pool.query(`SELECT name, party_size FROM spectator_signups WHERE ticket_code = $1`, [base]);
+    if (!rows.length) return res.json({ success: true, status: "invalid", message: "Ticket not found" });
+    const n = partyCount(rows[0].party_size);
+    if ((n === 1 && idx !== null) || (n > 1 && (idx === null || idx < 1 || idx > n)))
+      return res.json({ success: true, status: "invalid", message: "Ticket not found" });
+    const ins = await pool.query(`INSERT INTO spectator_checkins (code, base) VALUES ($1, $2) ON CONFLICT (code) DO NOTHING RETURNING checked_at`, [code, base]);
+    if (ins.rowCount) return res.json({ success: true, status: "valid", name: rows[0].name, code, message: "Valid – admit 1 person" });
+    const prev = await pool.query(`SELECT checked_at FROM spectator_checkins WHERE code = $1`, [code]);
+    res.json({ success: true, status: "used", name: rows[0].name, code, checked_at: prev.rows[0].checked_at, message: "Already used" });
+  } catch (err) {
+    console.error("checkin error:", err);
+    res.status(500).json({ success: false, error: "Server error" });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
